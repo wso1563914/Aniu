@@ -104,7 +104,8 @@ docker run -d \
 
 ```bash
 cd backend
-python3 -m venv .venv
+python -m venv .venv
+.\.venv\Scripts\activate
 ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env
 ./.venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 8000

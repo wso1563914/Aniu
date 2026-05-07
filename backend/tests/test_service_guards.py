@@ -304,6 +304,27 @@ def test_parse_llm_stream_response_raises_for_error_chunk() -> None:
         service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
 
 
+def test_parse_llm_stream_response_captures_reasoning_content() -> None:
+    service = LLMService()
+
+    lines = iter(
+        [
+            'data: {"choices":[{"index":0,"delta":{"reasoning_content":"foo"}}]}',
+            "",
+            'data: {"choices":[{"index":0,"delta":{"reasoning_content":"bar"}}]}',
+            "",
+            'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}',
+            "",
+        ]
+    )
+
+    payload = service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
+    message = payload["choices"][0]["message"]
+
+    assert message["content"] == "Hello"
+    assert message["reasoning_content"] == "foobar"
+
+
 def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:
     service = LLMService()
     seen_payloads: list[dict[str, object]] = []

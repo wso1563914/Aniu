@@ -225,7 +225,7 @@ class LLMService:
     def close(self) -> None:
         return None
 
-    def chat(
+    def chat_result(
         self,
         *,
         model: str,
@@ -237,7 +237,7 @@ class LLMService:
         tool_context: dict[str, Any] | None = None,
         emit: Any = None,
         cancel_event: threading.Event | None = None,
-    ) -> str:
+    ) -> dict[str, Any]:
         payload_messages: list[dict[str, Any]] = []
         effective_system_prompt = self._augment_system_prompt(
             system_prompt,
@@ -262,7 +262,7 @@ class LLMService:
                 context=chat_tool_context,
             )
 
-        result = self._agent_loop(
+        return self._agent_loop(
             model=model,
             base_url=base_url,
             api_key=api_key,
@@ -270,6 +270,31 @@ class LLMService:
             run_type="chat",
             timeout_seconds=timeout_seconds,
             tool_executor=_chat_tool_executor,
+            emit=emit,
+            cancel_event=cancel_event,
+        )
+
+    def chat(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str,
+        system_prompt: str | None,
+        messages: list[dict[str, str]],
+        timeout_seconds: int = 60,
+        tool_context: dict[str, Any] | None = None,
+        emit: Any = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        result = self.chat_result(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            messages=messages,
+            timeout_seconds=timeout_seconds,
+            tool_context=tool_context,
             emit=emit,
             cancel_event=cancel_event,
         )
@@ -447,6 +472,9 @@ class LLMService:
                 "role": "assistant",
                 "content": message.get("content") or "",
             }
+            reasoning_content = message.get("reasoning_content") or message.get("reasoning")
+            if isinstance(reasoning_content, str) and reasoning_content.strip():
+                assistant_entry["reasoning_content"] = reasoning_content
             if message.get("tool_calls"):
                 assistant_entry["tool_calls"] = message["tool_calls"]
             messages.append(assistant_entry)
@@ -628,6 +656,7 @@ class LLMService:
     ) -> dict[str, Any]:
         data_lines: list[str] = []
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
         finish_reason: str | None = None
@@ -709,6 +738,12 @@ class LLMService:
                     if isinstance(item, dict):
                         _merge_stream_tool_call(tool_calls, item)
 
+            delta_reasoning = _to_stream_text_content(
+                delta.get("reasoning_content") or delta.get("reasoning")
+            )
+            if delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+
             delta_text = _to_stream_text_content(delta.get("content"))
             if delta_text:
                 content_parts.append(delta_text)
@@ -750,6 +785,10 @@ class LLMService:
             "role": "assistant",
             "content": final_text,
         }
+        reasoning_content = "".join(reasoning_parts).strip()
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+
         ordered_tool_calls = [tool_calls[idx] for idx in sorted(tool_calls)]
         if ordered_tool_calls:
             message["tool_calls"] = ordered_tool_calls

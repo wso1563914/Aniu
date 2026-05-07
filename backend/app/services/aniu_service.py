@@ -1945,6 +1945,28 @@ class AniuService:
                             tool_calls=tool_calls if isinstance(tool_calls, list) else None,
                             executed_actions=executed_actions,
                         )
+                        final_message = (
+                            llm_response.get("final_message")
+                            if isinstance(llm_response, dict)
+                            else None
+                        )
+                        reasoning_content = ""
+                        if isinstance(final_message, dict):
+                            value = final_message.get("reasoning_content") or final_message.get(
+                                "reasoning"
+                            )
+                            if isinstance(value, str):
+                                reasoning_content = value.strip()
+
+                        meta_payload = {
+                            "run_type": str(
+                                getattr(settings, "run_type", "analysis") or "analysis"
+                            ),
+                            "executed_action_count": len(executed_actions),
+                        }
+                        if reasoning_content:
+                            meta_payload["reasoning_content"] = reasoning_content
+
                         response_message = self._persist_persistent_session_assistant_message(
                             db=db,
                             session=session,
@@ -1952,12 +1974,7 @@ class AniuService:
                             content=assistant_content,
                             tool_calls=tool_calls if isinstance(tool_calls, list) else None,
                             status="completed",
-                            meta_payload={
-                                "run_type": str(
-                                    getattr(settings, "run_type", "analysis") or "analysis"
-                                ),
-                                "executed_action_count": len(executed_actions),
-                            },
+                            meta_payload=meta_payload,
                         )
                         session_context.response_message_id = response_message.id
                         run.response_message_id = response_message.id
@@ -2681,7 +2698,13 @@ class AniuService:
             content = str(record.content or "").strip()
             if not content:
                 continue
-            messages.append({"role": record.role, "content": content})
+            entry: dict[str, Any] = {"role": record.role, "content": content}
+            if record.role == "assistant":
+                meta = record.meta_payload if isinstance(record.meta_payload, dict) else {}
+                reasoning_content = meta.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    entry["reasoning_content"] = reasoning_content
+            messages.append(entry)
         return messages
 
     def _retrieve_persistent_session_memory_messages(

@@ -637,7 +637,13 @@ class ChatSessionService:
                         content_parts.append(prompt_text)
                 text = "\n".join(part for part in content_parts if part).strip()
 
-            history.append({"role": record.role, "content": text})
+            entry: dict[str, Any] = {"role": record.role, "content": text}
+            if record.role == "assistant":
+                meta = record.meta_payload if isinstance(record.meta_payload, dict) else {}
+                reasoning_content = meta.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content.strip():
+                    entry["reasoning_content"] = reasoning_content
+            history.append(entry)
         return history
 
     def _derive_title(self, content: str) -> str:
@@ -720,6 +726,7 @@ class ChatSessionService:
 
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         captured_tool_calls: list[dict[str, Any]] = []
+        final_message_holder: dict[str, Any] = {}
         cancel_event = Event()
 
         def _emit(event_type: str, **data: Any) -> None:
@@ -727,7 +734,7 @@ class ChatSessionService:
 
         def _worker() -> None:
             try:
-                content = llm_service.chat(
+                result = llm_service.chat_result(
                     model=settings_snapshot.llm_model,
                     base_url=settings_snapshot.llm_base_url,
                     api_key=settings_snapshot.llm_api_key,
@@ -741,6 +748,8 @@ class ChatSessionService:
                     emit=_emit,
                     cancel_event=cancel_event,
                 )
+                final_message_holder["final_message"] = result.get("final_message")
+                content = str(result.get("final_answer") or "").strip()
                 _emit("completed", message=content)
             except LLMStreamCancelled:
                 logger.info("chat_session stream worker cancelled: session_id=%s", session_id)
@@ -869,12 +878,22 @@ class ChatSessionService:
                     else:
                         assistant_content = str(final_content or "").strip()
 
+                    meta_payload: dict[str, Any] | None = None
+                    final_message = final_message_holder.get("final_message")
+                    if isinstance(final_message, dict):
+                        reasoning_value = final_message.get("reasoning_content") or final_message.get(
+                            "reasoning"
+                        )
+                        if isinstance(reasoning_value, str) and reasoning_value.strip():
+                            meta_payload = {"reasoning_content": reasoning_value}
+
                     if assistant_content or captured_tool_calls:
                         assistant_record = ChatMessageRecord(
                             session_id=session_id,
                             role="assistant",
                             content=assistant_content,
                             tool_calls=captured_tool_calls or None,
+                            meta_payload=meta_payload,
                         )
                         db.add(assistant_record)
                         session.last_message_at = datetime.now(timezone.utc)
