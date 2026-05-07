@@ -43,56 +43,6 @@
 
 ---
 
-### 快速部署（Docker）
-
-#### 1. 准备环境模板
-
-```bash
-cp .env.docker.example .env.docker
-```
-
-#### 2. 设置登录密码
-
-编辑 `.env.docker`：
-
-```text
-APP_LOGIN_PASSWORD=your-password
-```
-
-#### 3. 启动服务
-
-**方式一：docker compose**
-
-```bash
-docker compose pull && docker compose up -d
-```
-
-**方式二：docker run**
-
-```bash
-docker pull ghcr.io/anacondakc/aniu:latest
-
-docker run -d \
-  --name aniu \
-  -p 8000:8000 \
-  --env-file .env.docker \
-  -v "$(pwd)/data:/app/data" \
-  ghcr.io/anacondakc/aniu:latest
-```
-
-#### 4. 登录并配置
-
-访问 `http://<主机IP>:8000`，使用密码登录后，在「功能设置」中填写：
-
-- `OpenAI API Key`
-- `OpenAI Base URL`
-- `OpenAI Model`
-- `妙想密钥`
-
-保存后即可使用 AI 分析与妙想工具。
-
----
-
 ### 本地开发
 
 #### 环境要求
@@ -124,6 +74,11 @@ npm run dev
 默认地址：`http://127.0.0.1:3003`
 
 > Vite 开发时会自动将 `/api` 和 `/health` 代理到后端 `8000` 端口。
+
+### 快速启动
+
+在项目根目录执行这一条（PowerShell）：
+powershell -NoProfile -Command "Start-Process powershell -ArgumentList '-NoProfile','-Command','cd E:\demoSpace\Aniu-main\backend; .\.venv\Scripts\Activate.ps1; python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload'; Start-Process powershell -ArgumentList '-NoProfile','-Command','cd E:\demoSpace\Aniu-main\frontend; npm run dev'"
 
 ---
 
