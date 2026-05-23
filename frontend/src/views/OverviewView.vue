@@ -24,11 +24,7 @@
                 <span class="meta-label">账户状态</span>
                 <strong>{{ formatDays(account?.operating_days) }}</strong>
                 <p>运作天数</p>
-                <div class="stat-card-inline">
-                  <span>开户日期</span>
-                  <b>{{ account?.open_date || '--' }}</b>
-                </div>
-                <div class="stat-card-inline">
+               <div class="stat-card-inline">
                   <span>交易成功率</span>
                   <b :class="tradeSuccessRateClass(tradeSuccessRate)">{{ formatPercent(tradeSuccessRate) }}</b>
                 </div>
@@ -40,10 +36,6 @@
                 <div class="stat-card-inline">
                   <span>初始资金</span>
                   <b>{{ formatMoney(account?.initial_capital) }}</b>
-                </div>
-                <div class="stat-card-inline">
-                  <span>初始净值</span>
-                  <b>1.000</b>
                 </div>
               </div>
               <div class="stat-card">
@@ -66,10 +58,6 @@
                 <div class="stat-card-inline">
                   <span>总收益率</span>
                   <b :class="profitClass(account?.total_return_ratio)">{{ formatPercent(account?.total_return_ratio) }}</b>
-                </div>
-                <div class="stat-card-inline">
-                  <span>当前净值</span>
-                  <b :class="profitClass(getNavDelta(account?.nav))">{{ formatNav(account?.nav) }}</b>
                 </div>
               </div>
               <div class="stat-card">
@@ -275,164 +263,6 @@
             </div>
           </section>
 
-          <!-- 运行总览面板 -->
-          <section class="panel runtime-panel">
-            <div class="panel-head">
-              <div class="head-main">
-                <h2>运行总览</h2>
-                <p class="section-kicker">Runtime Overview</p>
-              </div>
-            </div>
-            <div class="runtime-content">
-              <!-- 最近一次分析 -->
-              <div class="runtime-section">
-                <h4 class="runtime-title">最近一次分析</h4>
-                <div class="runtime-stats">
-                  <div class="runtime-stat">
-                    <span class="stat-label">启动时间</span>
-                    <span class="stat-value stat-value-compact">{{ formatRuntimeTime(runtimeOverview.last_run.start_time) }}</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">停止时间</span>
-                    <span class="stat-value stat-value-compact">{{ formatRuntimeTime(runtimeOverview.last_run.end_time) }}</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">状态</span>
-                    <span class="stat-value" :class="runtimeOverview.last_run.status === 'completed' ? 'status-success' : runtimeOverview.last_run.status === 'failed' ? 'status-failed' : ''">{{ runtimeOverview.last_run.status_text }}</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">持续时长</span>
-                    <span class="stat-value">{{ runtimeOverview.last_run.duration }}</span>
-                  </div>
-                </div>
-                <div class="runtime-token-bar">
-                  <div class="runtime-token-item">
-                    <span class="token-label">输入</span>
-                    <span class="token-value">{{ runtimeOverview.last_run.input_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item">
-                    <span class="token-label">输出</span>
-                    <span class="token-value">{{ runtimeOverview.last_run.output_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-total">
-                    <span class="token-label">总量</span>
-                    <span class="token-value">{{ runtimeOverview.last_run.total_tokens }}</span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 今日统计 -->
-              <div class="runtime-section">
-                <h4 class="runtime-title">今日统计</h4>
-                <div class="runtime-stats">
-                  <div class="runtime-stat">
-                    <span class="stat-label">AI分析</span>
-                    <span class="stat-value">{{ runtimeOverview.today.analysis_count }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">接口调用</span>
-                    <span class="stat-value">{{ runtimeOverview.today.api_calls }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">交易执行</span>
-                    <span class="stat-value">{{ runtimeOverview.today.trades }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">成功率</span>
-                    <span class="stat-value">{{ runtimeOverview.today.success_rate }}%</span>
-                  </div>
-                </div>
-                <div class="runtime-token-bar">
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输入</span>
-                    <span class="token-value">{{ runtimeOverview.today.input_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输出</span>
-                    <span class="token-value">{{ runtimeOverview.today.output_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-total">
-                    <span class="token-label">总量</span>
-                    <span class="token-value">{{ runtimeOverview.today.total_tokens }}</span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 近3个交易日 -->
-              <div class="runtime-section">
-                <h4 class="runtime-title">近3个交易日</h4>
-                <div class="runtime-stats">
-                  <div class="runtime-stat">
-                    <span class="stat-label">AI分析</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_3_days.analysis_count }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">接口调用</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_3_days.api_calls }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">交易执行</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_3_days.trades }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">成功率</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_3_days.success_rate }}%</span>
-                  </div>
-                </div>
-                <div class="runtime-token-bar">
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输入</span>
-                    <span class="token-value">{{ runtimeOverview.recent_3_days.input_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输出</span>
-                    <span class="token-value">{{ runtimeOverview.recent_3_days.output_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-total">
-                    <span class="token-label">总量</span>
-                    <span class="token-value">{{ runtimeOverview.recent_3_days.total_tokens }}</span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 近7个交易日 -->
-              <div class="runtime-section">
-                <h4 class="runtime-title">近7个交易日</h4>
-                <div class="runtime-stats">
-                  <div class="runtime-stat">
-                    <span class="stat-label">AI分析</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_7_days.analysis_count }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">接口调用</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_7_days.api_calls }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">交易执行</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_7_days.trades }}次</span>
-                  </div>
-                  <div class="runtime-stat">
-                    <span class="stat-label">成功率</span>
-                    <span class="stat-value">{{ runtimeOverview.recent_7_days.success_rate }}%</span>
-                  </div>
-                </div>
-                <div class="runtime-token-bar">
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输入</span>
-                    <span class="token-value">{{ runtimeOverview.recent_7_days.input_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-muted">
-                    <span class="token-label">输出</span>
-                    <span class="token-value">{{ runtimeOverview.recent_7_days.output_tokens }}</span>
-                  </div>
-                  <div class="runtime-token-item runtime-token-item-total">
-                    <span class="token-label">总量</span>
-                    <span class="token-value">{{ runtimeOverview.recent_7_days.total_tokens }}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
         </section>
       </div>
 </template>
@@ -441,10 +271,10 @@
 import { computed, onMounted, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useAppStore } from '@/stores/legacy'
-import { formatMinuteTime, formatMoney, formatPercent, formatTime } from '@/utils/formatters'
+import { formatMinuteTime, formatMoney, formatPercent } from '@/utils/formatters'
 
 const store = useAppStore()
-const { account, runtimeOverview, errorMessage, accountRefreshing, canManualRefreshAccount, accountRefreshCooldownText } = storeToRefs(store)
+const { account, errorMessage, accountRefreshing, canManualRefreshAccount, accountRefreshCooldownText } = storeToRefs(store)
 
 const displayPositions = computed(() => account.value.positions.filter((position) => (position.volume ?? 0) > 0))
 const displayOrders = computed(() => account.value.orders)
@@ -501,13 +331,6 @@ function formatVolume(value: number | null | undefined) {
   return `${value.toLocaleString()} 股`
 }
 
-function formatNav(value: number | null | undefined) {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return '--'
-  }
-  return value.toFixed(3)
-}
-
 function formatDays(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '--'
@@ -522,21 +345,6 @@ function formatTradeCount(value: number | null | undefined) {
   return `${value} 次`
 }
 
-function formatRuntimeTime(value: string | null | undefined) {
-  const text = formatTime(value)
-  if (text === '从未运行' || text === '--') {
-    return text
-  }
-
-  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2}:\d{2})$/)
-  if (!match) {
-    return text
-  }
-
-  const [, , month, day, time] = match
-  return `${month}-${day} ${time}`
-}
-
 function getAssetDelta(totalAssets: number | null | undefined, initialCapital: number | null | undefined) {
   if (
     totalAssets === null || totalAssets === undefined || Number.isNaN(totalAssets)
@@ -545,13 +353,6 @@ function getAssetDelta(totalAssets: number | null | undefined, initialCapital: n
     return null
   }
   return totalAssets - initialCapital
-}
-
-function getNavDelta(nav: number | null | undefined) {
-  if (nav === null || nav === undefined || Number.isNaN(nav)) {
-    return null
-  }
-  return nav - 1
 }
 
 function getOrderStatusClass(statusText: string | null | undefined) {
@@ -564,8 +365,6 @@ onMounted(async () => {
   if (account.value.positions.length === 0) {
     tasks.push(store.refreshAccountData())
   }
-
-  tasks.push(store.refreshRuntimeOverview())
 
   if (tasks.length > 0) {
     const results = await Promise.allSettled(tasks)

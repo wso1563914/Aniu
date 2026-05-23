@@ -19,6 +19,7 @@
           @select-persistent="handleSelectPersistent"
           @create="handleCreate"
           @delete="handleDelete"
+          @delete-persistent="handleDeletePersistent"
         />
 
         <ChatConversation
@@ -95,6 +96,7 @@ const {
   loadSession: loadPersistentSession,
   loadOlderMessages: loadOlderPersistentMessages,
   refreshSummaryOnly: refreshPersistentSummaryOnly,
+  deleteSession: deletePersistentSession,
   appendSystemMessage: appendPersistentSystemMessage,
   clear: clearPersistentSession,
 } = usePersistentSession()
@@ -210,6 +212,14 @@ async function handleDelete(sessionId: number) {
     }
   } catch (error) {
     errorMessage.value = (error as Error).message
+  }
+}
+
+async function handleDeletePersistent() {
+  try {
+    await deletePersistentSession()
+  } catch (error) {
+    persistentErrorMessage.value = (error as Error).message
   }
 }
 

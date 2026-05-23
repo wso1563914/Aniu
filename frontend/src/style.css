@@ -800,18 +800,6 @@ textarea {
   color: #7a90b0;
 }
 
-/* 运行总览样式 */
-.runtime-panel {
-  margin-top: 16px;
-}
-
-.runtime-content {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 16px;
-}
-
 .chat-panel {
   margin-top: 12px;
 }
@@ -1729,137 +1717,6 @@ textarea {
     padding: 12px;
     border-radius: 11px;
   }
-}
-
-.runtime-section {
-  padding: 14px;
-  background: rgba(15, 23, 42, 0.3);
-  border-radius: 10px;
-  border: 1px solid rgba(145, 170, 214, 0.1);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.runtime-title {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  color: #7a90b0;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.runtime-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px 12px;
-}
-
-.runtime-stat {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  gap: 2px;
-  min-width: 0;
-  min-height: 74px;
-  padding: 24px 10px 8px;
-  background: rgba(9, 14, 24, 0.45);
-  border-radius: 8px;
-  box-sizing: border-box;
-}
-
-.runtime-stat .stat-label {
-  position: absolute;
-  top: 8px;
-  left: 10px;
-  font-size: 10px;
-  color: #5a7090;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  text-align: left;
-}
-
-.runtime-stat .stat-value {
-  display: block;
-  width: auto;
-  max-width: 100%;
-  font-size: 16px;
-  font-weight: 700;
-  color: #eef4ff;
-  line-height: 1.15;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: center;
-}
-
-.runtime-stat .stat-value-compact {
-  font-size: 13px;
-  letter-spacing: -0.01em;
-}
-
-.runtime-stat .stat-value.status-success {
-  color: #72e2a3;
-}
-
-.runtime-stat .stat-value.status-failed {
-  color: #ff8d9f;
-}
-
-.runtime-token-bar {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: auto;
-  padding-top: 2px;
-}
-
-.runtime-token-item {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  min-width: 0;
-  padding: 8px 10px;
-  background: rgba(81, 180, 255, 0.08);
-  border: 1px solid rgba(81, 180, 255, 0.12);
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.runtime-token-item-total {
-  background: rgba(28, 214, 166, 0.12);
-  border-color: rgba(28, 214, 166, 0.16);
-}
-
-.runtime-token-item-muted {
-  background: rgba(145, 170, 214, 0.08);
-  border-color: rgba(145, 170, 214, 0.1);
-}
-
-.runtime-token-bar .token-label {
-  font-size: 10px;
-  color: #7a90b0;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  text-align: center;
-}
-
-.runtime-token-bar .token-value {
-  display: block;
-  max-width: 100%;
-  font-size: 12px;
-  font-weight: 700;
-  color: #eef4ff;
-  line-height: 1.2;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-align: center;
 }
 
 .logs-panel {
@@ -4284,10 +4141,6 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .runtime-content {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  
   .overview-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -4340,15 +4193,6 @@ textarea {
   }
 
   .overview-stats {
-    grid-template-columns: 1fr;
-  }
-
-  .runtime-content,
-  .runtime-stats {
-    grid-template-columns: 1fr;
-  }
-
-  .runtime-token-bar {
     grid-template-columns: 1fr;
   }
 

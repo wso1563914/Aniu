@@ -3,11 +3,11 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import app.services.account_service as account_service_module
 import queue
 import secrets
 import time
 import traceback
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
@@ -30,11 +30,47 @@ from app.db.models import (
     StrategySchedule,
     TradeOrder,
 )
+from app.domain.schedule.policy import (
+    ANALYSIS_TASK_NAMES,
+    SCHEDULE_MAX_RETRIES,
+    SCHEDULE_RETRY_DELAY,
+    assume_utc as schedule_assume_utc,
+    compute_next_run_at,
+    now_utc as schedule_now_utc,
+    now_shanghai as schedule_now_shanghai,
+    resolve_schedule_run_type,
+)
+from app.domain.trading.intents import (
+    PolicyDecision,
+    TradeExecutionIntent,
+    TradeProposal,
+    intents_from_proposals,
+    intents_to_records,
+    proposals_to_records,
+)
+from app.domain.trading.risk_gate import risk_gate
 from app.schemas.aniu import AppSettingsUpdate, ChatRequest, ScheduleUpdate
 from app.schemas.aniu import ChatMessageRead, PersistentSessionRead
 from app.skills.providers import build_skill_context
-from app.services.event_bus import event_bus, make_emitter
+from app.services.event_bus import event_bus
+from app.events.publisher import run_event_publisher
+from app.services.automation_session_service import (
+    AUTOMATION_COMPACTION_TRIGGER_RATIO,
+    AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS,
+    AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS,
+    AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT,
+    AUTOMATION_SESSION_SLUG,
+    AUTOMATION_SESSION_TITLE,
+    PersistentRunSessionContext,
+    automation_session_service,
+)
 from app.services.llm_service import LLMStreamCancelled, llm_service
+from app.services.account_service import account_service
+from app.services.run_service import run_service
+from app.services.run_service import RunInvocationError
+from app.services.run_query_service import run_query_service
+from app.services.schedule_service import schedule_service
+from app.services.settings_service import settings_service
 from app.services.token_estimator import estimate_messages_tokens, estimate_text_tokens
 from app.services.trading_calendar_service import trading_calendar_service
 from skills.mx_core.client import MXClient
@@ -46,47 +82,22 @@ logger = logging.getLogger(__name__)
 RAW_TOOL_PREVIEW_MAX_CHARS = 6000
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-ANALYSIS_TASK_NAMES = {"盘前分析", "午间复盘", "收盘分析"}
-SCHEDULE_RETRY_DELAY = timedelta(minutes=5)
-SCHEDULE_MAX_RETRIES = 3
 ACCOUNT_PREFETCH_TOOL_NAMES = (
     "mx_get_balance",
     "mx_get_positions",
     "mx_get_orders",
 )
 ACCOUNT_OVERVIEW_CACHE_MAX_WORKERS = 3
-AUTOMATION_SESSION_SLUG = "automation-default"
-AUTOMATION_SESSION_TITLE = "自动化交易会话"
-AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
-AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT = 24
-AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS = 12
-AUTOMATION_COMPACTION_TRIGGER_RATIO = 0.85
-
-
-@dataclass
-class PersistentRunSessionContext:
-    session_id: int
-    prompt_message_id: int
-    response_message_id: int | None
-    summary_revision: int | None
-    context_tokens_estimate: int | None
-    messages: list[dict[str, Any]]
-
-
 def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return schedule_now_utc()
 
 
 def now_shanghai() -> datetime:
-    return now_utc().astimezone(SHANGHAI_TZ)
+    return schedule_now_shanghai()
 
 
 def _assume_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+    return schedule_assume_utc(value)
 
 
 def _parse_float(value: Any) -> float | None:
@@ -191,22 +202,42 @@ def _order_status_text(
 class AniuService:
     def __init__(self) -> None:
         self._run_lock = Lock()
-        self._account_cache_lock = Lock()
-        self._account_overview_cache: dict[str, Any] | None = None
-        self._account_overview_cache_expires_at: datetime | None = None
+        self._sync_account_cache_fields()
+        self._configure_automation_session_hooks()
+        self._configure_run_service_hooks()
+
+    def _sync_account_cache_fields(self) -> None:
+        self._account_cache_lock = account_service._account_cache_lock
+        self._account_overview_cache = account_service._account_overview_cache
+        self._account_overview_cache_expires_at = (
+            account_service._account_overview_cache_expires_at
+        )
+
+    def _configure_automation_session_hooks(self) -> None:
+        automation_session_service.configure_hooks(
+            settings_loader=self.get_or_create_settings,
+            assume_utc=_assume_utc,
+            now_utc=now_utc,
+            now_shanghai=now_shanghai,
+            build_analysis_summary=self._build_analysis_summary,
+        )
+
+    def _configure_run_service_hooks(self) -> None:
+        run_service.configure_hooks(
+            run_lock=self._run_lock,
+            prepare_run=(self, "_prepare_run"),
+            run_body=(self, "_run_body"),
+            list_schedules=(self, "list_schedules"),
+            execute_run=(self, "execute_run"),
+            session_scope=session_scope,
+            now_shanghai=lambda: now_shanghai(),
+            assume_utc=_assume_utc,
+            compute_next_run_at=(self, "_compute_next_run_at"),
+            trading_calendar_service=trading_calendar_service,
+        )
 
     def _resolve_run_type(self, schedule: StrategySchedule | None) -> str:
-        if schedule is None:
-            return "analysis"
-
-        run_type = str(schedule.run_type or "").strip()
-        if run_type in {"analysis", "trade"}:
-            return run_type
-
-        name = str(schedule.name or "").strip()
-        if name.startswith("上午运行") or name.startswith("下午运行"):
-            return "trade"
-        return "analysis"
+        return schedule_service.resolve_run_type(schedule)
 
     def _resolve_manual_run_profile(
         self,
@@ -245,30 +276,7 @@ class AniuService:
         return False
 
     def _infer_run_type(self, run: StrategyRun) -> str:
-        schedule_name = str(run.schedule_name or "").strip()
-        if schedule_name in ANALYSIS_TASK_NAMES:
-            return "analysis"
-        if schedule_name.startswith("上午运行") or schedule_name.startswith("下午运行"):
-            return "trade"
-
-        if run.trade_orders:
-            return "trade"
-
-        executed_actions = run.executed_actions if isinstance(run.executed_actions, list) else []
-        trade_actions = {"BUY", "SELL", "CANCEL"}
-        if any(str(item.get("action") or "").upper() in trade_actions for item in executed_actions if isinstance(item, dict)):
-            return "trade"
-
-        tool_calls = self._get_run_tool_calls(run)
-        trade_tool_names = {"mx_moni_trade", "mx_moni_cancel"}
-        if any(str(item.get("name") or "") in trade_tool_names for item in tool_calls):
-            return "trade"
-
-        stored_run_type = str(run.run_type or "").strip()
-        if stored_run_type in {"trade", "analysis"}:
-            return stored_run_type
-
-        return "analysis"
+        return run_query_service.infer_run_type(run)
 
     def authenticate_login(self, password: str) -> dict[str, Any]:
         settings = get_settings()
@@ -287,131 +295,18 @@ class AniuService:
         }
 
     def get_or_create_settings(self, db: Session) -> AppSettings:
-        instance = db.scalar(select(AppSettings).limit(1))
-        if instance is None:
-            env = get_settings()
-            instance = AppSettings(
-                provider_name="openai-compatible",
-                mx_api_key=env.mx_apikey,
-                llm_base_url=env.openai_base_url,
-                llm_api_key=env.openai_api_key,
-                llm_model=env.openai_model,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-            )
-            db.add(instance)
-            db.commit()
-            db.refresh(instance)
-        return instance
+        return settings_service.get_or_create_settings(db)
 
     def list_schedules(self, db: Session) -> list[StrategySchedule]:
-        stmt = select(StrategySchedule).order_by(StrategySchedule.id.asc())
-        schedules = list(db.scalars(stmt).all())
-        mutated = False
-        for schedule in schedules:
-            if not schedule.name:
-                schedule.name = "默认任务"
-                mutated = True
-            if str(schedule.run_type or "").strip() not in {"analysis", "trade"}:
-                schedule.run_type = self._resolve_run_type(schedule)
-                mutated = True
-            if not schedule.cron_expression:
-                schedule.cron_expression = "*/30 * * * *"
-                mutated = True
-            if not schedule.task_prompt:
-                schedule.task_prompt = "请根据当前市场和持仓情况生成交易决策。"
-                mutated = True
-            if not schedule.timeout_seconds or schedule.timeout_seconds <= 0:
-                schedule.timeout_seconds = 1800
-                mutated = True
-            if schedule.retry_count < 0:
-                schedule.retry_count = 0
-                mutated = True
-            if schedule.enabled and schedule.next_run_at is None:
-                schedule.next_run_at = self._compute_next_run_at(
-                    schedule.cron_expression
-                )
-                mutated = True
-        if mutated:
-            db.commit()
-            for schedule in schedules:
-                db.refresh(schedule)
-        if not schedules:
-            instance = StrategySchedule(
-                name="默认任务",
-                run_type="analysis",
-                cron_expression="*/30 * * * *",
-                task_prompt="请根据当前市场和持仓情况生成交易决策。",
-                timeout_seconds=1800,
-                enabled=False,
-            )
-            db.add(instance)
-            db.commit()
-            db.refresh(instance)
-            schedules = [instance]
-        for schedule in schedules:
-            schedule.retry_count = max(int(schedule.retry_count or 0), 0)
-            schedule.last_run_at = _assume_utc(schedule.last_run_at)
-            schedule.next_run_at = _assume_utc(schedule.next_run_at)
-            schedule.retry_after_at = _assume_utc(schedule.retry_after_at)
-            schedule.created_at = _assume_utc(schedule.created_at)
-            schedule.updated_at = _assume_utc(schedule.updated_at)
-        return schedules
+        return schedule_service.list_schedules(db)
 
     def update_settings(self, db: Session, payload: AppSettingsUpdate) -> AppSettings:
-        instance = self.get_or_create_settings(db)
-        sensitive_fields = {"mx_api_key", "llm_api_key"}
-        changed_fields: list[str] = []
-        for field, value in payload.model_dump().items():
-            if field in sensitive_fields:
-                if isinstance(value, str) and "****" in value:
-                    continue
-            old_value = getattr(instance, field, None)
-            if old_value != value:
-                changed_fields.append(field)
-            setattr(instance, field, value)
-        db.add(instance)
-        db.commit()
-        db.refresh(instance)
-        instance.created_at = _assume_utc(instance.created_at)
-        instance.updated_at = _assume_utc(instance.updated_at)
-        logger.info("settings updated: changed_fields=%s", changed_fields)
-        return instance
+        return settings_service.update_settings(db, payload)
 
     def replace_schedules(
         self, db: Session, payloads: list[ScheduleUpdate]
     ) -> list[StrategySchedule]:
-        existing = {item.id: item for item in self.list_schedules(db)}
-        keep_ids: set[int] = set()
-
-        for payload in payloads:
-            data = payload.model_dump()
-            schedule_id = data.pop("id", None)
-            if schedule_id is not None and schedule_id in existing:
-                instance = existing[schedule_id]
-            else:
-                instance = StrategySchedule()
-                db.add(instance)
-                db.flush()
-
-            for field, value in data.items():
-                setattr(instance, field, value)
-
-            instance.next_run_at = self._compute_next_run_at(instance.cron_expression)
-            db.add(instance)
-            db.flush()
-            keep_ids.add(instance.id)
-
-        for schedule_id, instance in existing.items():
-            if schedule_id not in keep_ids:
-                db.delete(instance)
-
-        db.commit()
-        logger.info(
-            "schedules replaced: kept=%s, deleted=%s",
-            keep_ids,
-            set(existing.keys()) - keep_ids,
-        )
-        return self.list_schedules(db)
+        return schedule_service.replace_schedules(db, payloads)
 
     def list_runs(
         self,
@@ -421,30 +316,13 @@ class AniuService:
         status: str | None = None,
         before_id: int | None = None,
     ) -> list[StrategyRun]:
-        stmt = select(StrategyRun)
-
-        if run_date is not None:
-            start_of_day = datetime.combine(run_date, datetime.min.time())
-            end_of_day = start_of_day + timedelta(days=1)
-            stmt = stmt.where(
-                StrategyRun.started_at >= start_of_day,
-                StrategyRun.started_at < end_of_day,
-            )
-
-        normalized_status = str(status or "").strip().lower()
-        if normalized_status:
-            stmt = stmt.where(StrategyRun.status == normalized_status)
-
-        if before_id is not None:
-            stmt = stmt.where(StrategyRun.id < before_id)
-
-        stmt = stmt.order_by(StrategyRun.started_at.desc(), StrategyRun.id.desc()).limit(
-            limit
+        return run_query_service.list_runs(
+            db,
+            limit=limit,
+            run_date=run_date,
+            status=status,
+            before_id=before_id,
         )
-        runs = list(db.scalars(stmt).all())
-        for run in runs:
-            self._hydrate_run_datetimes(run, include_display_fields=False)
-        return runs
 
     def list_runs_page(
         self,
@@ -454,83 +332,24 @@ class AniuService:
         status: str | None = None,
         before_id: int | None = None,
     ) -> dict[str, Any]:
-        page_size = max(1, limit)
-        runs = self.list_runs(
+        return run_query_service.list_runs_page(
             db,
-            limit=page_size + 1,
+            limit=limit,
             run_date=run_date,
             status=status,
             before_id=before_id,
         )
-        has_more = len(runs) > page_size
-        items = runs[:page_size]
-        next_before_id = items[-1].id if has_more and items else None
-        return {
-            "items": items,
-            "next_before_id": next_before_id,
-            "has_more": has_more,
-        }
-
-    def get_runtime_overview(self, db: Session) -> dict[str, Any]:
-        runs = self.list_runs(db, limit=100)
-        latest_run = runs[0] if runs else None
-        return {
-            "last_run": self._build_runtime_last_run(latest_run),
-            "today": self._build_runtime_summary_section(
-                [run for run in runs if self._is_within_days(run.started_at, 1, same_day_only=True)]
-            ),
-            "recent_3_days": self._build_runtime_summary_section(
-                [run for run in runs if self._is_within_days(run.started_at, 3)]
-            ),
-            "recent_7_days": self._build_runtime_summary_section(
-                [run for run in runs if self._is_within_days(run.started_at, 7)]
-            ),
-        }
 
     def get_run(self, db: Session, run_id: int) -> StrategyRun | None:
-        stmt = (
-            select(StrategyRun)
-            .where(StrategyRun.id == run_id)
-            .options(selectinload(StrategyRun.trade_orders))
-        )
-        run = db.scalar(stmt)
-        if run is not None:
-            self._hydrate_run_datetimes(run, include_display_fields=True)
-        return run
+        return run_query_service.get_run(db, run_id)
 
     def get_run_raw_tool_preview(
         self, db: Session, run_id: int, preview_index: int
     ) -> dict[str, Any]:
-        run = self.get_run(db, run_id)
-        if run is None:
-            raise LookupError("运行记录不存在。")
-
-        preview = self._build_raw_tool_preview_by_index(run, preview_index)
-        if preview is None:
-            raise LookupError("原始工具预览不存在。")
-        return preview
+        return run_query_service.get_run_raw_tool_preview(db, run_id, preview_index)
 
     def get_persistent_session(self, db: Session) -> PersistentSessionRead:
-        session = self._get_or_create_persistent_session(db)
-        total_count = db.execute(
-            select(func.count(ChatMessageRecord.id)).where(
-                ChatMessageRecord.session_id == session.id
-            )
-        ).scalar_one()
-        return PersistentSessionRead(
-            id=session.id,
-            title=session.title,
-            kind=str(session.kind or "automation"),
-            slug=session.slug,
-            created_at=_assume_utc(session.created_at),
-            updated_at=_assume_utc(session.updated_at),
-            last_message_at=_assume_utc(session.last_message_at),
-            message_count=int(total_count),
-            archived_summary=session.archived_summary,
-            summary_revision=int(session.summary_revision or 0),
-            last_compacted_message_id=session.last_compacted_message_id,
-            last_compacted_run_id=session.last_compacted_run_id,
-        )
+        return automation_session_service.get_persistent_session(db)
 
     def list_persistent_session_messages(
         self,
@@ -539,61 +358,14 @@ class AniuService:
         limit: int = 50,
         before_id: int | None = None,
     ) -> tuple[PersistentSessionRead, list[ChatMessageRead], int | None, bool]:
-        session = self._get_or_create_persistent_session(db)
-        page_size = max(1, int(limit))
-        total_count = db.execute(
-            select(func.count(ChatMessageRecord.id)).where(
-                ChatMessageRecord.session_id == session.id
-            )
-        ).scalar_one()
+        return automation_session_service.list_persistent_session_messages(
+            db,
+            limit=limit,
+            before_id=before_id,
+        )
 
-        stmt = (
-            select(ChatMessageRecord)
-            .where(ChatMessageRecord.session_id == session.id)
-            .order_by(ChatMessageRecord.id.desc())
-        )
-        if before_id is not None:
-            stmt = stmt.where(ChatMessageRecord.id < before_id)
-
-        records = (
-            db.execute(stmt.limit(page_size + 1)).scalars().all()
-        )
-        has_more = len(records) > page_size
-        if has_more:
-            records = records[:page_size]
-        records.reverse()
-        next_before_id = records[0].id if has_more and records else None
-
-        session_read = PersistentSessionRead(
-            id=session.id,
-            title=session.title,
-            kind=str(session.kind or "automation"),
-            slug=session.slug,
-            created_at=_assume_utc(session.created_at),
-            updated_at=_assume_utc(session.updated_at),
-            last_message_at=_assume_utc(session.last_message_at),
-            message_count=int(total_count),
-            archived_summary=session.archived_summary,
-            summary_revision=int(session.summary_revision or 0),
-            last_compacted_message_id=session.last_compacted_message_id,
-            last_compacted_run_id=session.last_compacted_run_id,
-        )
-        return (
-            session_read,
-            [
-                ChatMessageRead(
-                    id=record.id,
-                    role=record.role,
-                    content=record.content,
-                    tool_calls=record.tool_calls,
-                    attachments=None,
-                    created_at=_assume_utc(record.created_at),
-                )
-                for record in records
-            ],
-            next_before_id,
-            has_more,
-        )
+    def delete_persistent_session(self, db: Session) -> None:
+        automation_session_service.delete_persistent_session(db)
 
     def delete_run(self, db: Session, run_id: int, *, force: bool = False) -> None:
         run = db.get(StrategyRun, run_id)
@@ -628,31 +400,16 @@ class AniuService:
     def _hydrate_run_datetimes(
         self, run: StrategyRun, *, include_display_fields: bool
     ) -> None:
-        run.started_at = _assume_utc(run.started_at)
-        run.finished_at = _assume_utc(run.finished_at)
-        run.run_type = self._infer_run_type(run)
-        self._hydrate_run_summary_metrics(run)
-        if include_display_fields:
-            self._hydrate_run_display_fields(run)
-            for order in run.trade_orders:
-                order.created_at = _assume_utc(order.created_at)
+        run_query_service.hydrate_run_datetimes(
+            run,
+            include_display_fields=include_display_fields,
+        )
 
     def _hydrate_run_summary_metrics(self, run: StrategyRun) -> None:
-        token_usage = self._get_run_token_usage(run)
-        run.api_call_count = self._count_run_api_calls(run)
-        run.executed_trade_count = self._count_executed_actions(run)
-        run.input_tokens = token_usage["input"]
-        run.output_tokens = token_usage["output"]
-        run.total_tokens = token_usage["total"]
+        run_query_service.hydrate_run_summary_metrics(run)
 
     def _hydrate_run_display_fields(self, run: StrategyRun) -> None:
-        run.output_markdown = (
-            str(run.final_answer or run.analysis_summary or run.error_message or "").strip()
-            or None
-        )
-        run.api_details = self._build_run_api_details(run)
-        run.raw_tool_previews = self._build_raw_tool_previews(run)
-        run.trade_details = self._build_run_trade_details(run)
+        run_query_service.hydrate_run_display_fields(run)
 
     def _format_token_count(self, value: int) -> str:
         if not isinstance(value, int) or value <= 0:
@@ -660,92 +417,6 @@ class AniuService:
         if value >= 1000:
             return f"{value / 1000:.1f}k"
         return str(value)
-
-    def _get_duration_text(
-        self, started_at: datetime | None, finished_at: datetime | None
-    ) -> str:
-        if started_at is None or finished_at is None:
-            return "进行中" if started_at is not None and finished_at is None else "--"
-        start = _assume_utc(started_at)
-        end = _assume_utc(finished_at)
-        if start is None or end is None or end <= start:
-            return "--"
-        total_seconds = int((end - start).total_seconds())
-        minutes = total_seconds // 60
-        seconds = total_seconds % 60
-        return f"{minutes}分{seconds:02d}秒"
-
-    def _get_runtime_status_text(self, status: str | None) -> str:
-        if status == "completed":
-            return "正常"
-        if status == "failed":
-            return "失败"
-        if status == "running":
-            return "进行中"
-        return "暂无记录"
-
-    def _is_within_days(
-        self,
-        started_at: datetime | None,
-        days: int,
-        *,
-        same_day_only: bool = False,
-    ) -> bool:
-        timestamp = _assume_utc(started_at)
-        if timestamp is None:
-            return False
-        now = now_utc()
-        if same_day_only:
-            local_started = timestamp.astimezone(SHANGHAI_TZ)
-            local_now = now.astimezone(SHANGHAI_TZ)
-            return local_started.date() == local_now.date()
-        return now - timestamp <= timedelta(days=days)
-
-    def _build_runtime_last_run(self, run: StrategyRun | None) -> dict[str, Any]:
-        if run is None:
-            return {
-                "start_time": "--",
-                "end_time": "--",
-                "status": "idle",
-                "status_text": "暂无记录",
-                "duration": "--",
-                "input_tokens": "--",
-                "output_tokens": "--",
-                "total_tokens": "--",
-            }
-
-        return {
-            "start_time": run.started_at.isoformat() if run.started_at else "--",
-            "end_time": run.finished_at.isoformat() if run.finished_at else "--",
-            "status": run.status,
-            "status_text": self._get_runtime_status_text(run.status),
-            "duration": self._get_duration_text(run.started_at, run.finished_at),
-            "input_tokens": self._format_token_count(int(run.input_tokens or 0)),
-            "output_tokens": self._format_token_count(int(run.output_tokens or 0)),
-            "total_tokens": self._format_token_count(int(run.total_tokens or 0)),
-        }
-
-    def _build_runtime_summary_section(
-        self, runs: list[StrategyRun]
-    ) -> dict[str, Any]:
-        analysis_count = len(runs)
-        success_count = sum(1 for run in runs if run.status == "completed")
-        api_calls = sum(int(run.api_call_count or 0) for run in runs)
-        trades = sum(int(run.executed_trade_count or 0) for run in runs)
-        input_tokens = sum(int(run.input_tokens or 0) for run in runs)
-        output_tokens = sum(int(run.output_tokens or 0) for run in runs)
-        total_tokens = sum(int(run.total_tokens or 0) for run in runs)
-        return {
-            "analysis_count": analysis_count,
-            "api_calls": api_calls,
-            "trades": trades,
-            "success_rate": round((success_count / analysis_count) * 100, 1)
-            if analysis_count > 0
-            else 0.0,
-            "input_tokens": self._format_token_count(input_tokens),
-            "output_tokens": self._format_token_count(output_tokens),
-            "total_tokens": self._format_token_count(total_tokens),
-        }
 
     def _get_api_tool_text(self, name: str) -> dict[str, str]:
         mapping = {
@@ -1098,24 +769,7 @@ class AniuService:
         return [item for item in tool_calls if isinstance(item, dict)]
 
     def _empty_account_overview(self, errors: list[str] | None = None) -> dict[str, Any]:
-        return {
-            "open_date": None,
-            "operating_days": None,
-            "initial_capital": None,
-            "total_assets": None,
-            "total_market_value": None,
-            "cash_balance": None,
-            "total_position_ratio": None,
-            "holding_profit": None,
-            "total_return_ratio": None,
-            "nav": None,
-            "daily_profit": None,
-            "daily_return_ratio": None,
-            "positions": [],
-            "orders": [],
-            "trade_summaries": [],
-            "errors": errors or [],
-        }
+        return account_service.empty_account_overview(errors)
 
     def _with_account_raw(
         self,
@@ -1126,11 +780,13 @@ class AniuService:
         positions_result: dict[str, Any] | None,
         orders_result: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        if include_raw:
-            overview["raw_balance"] = balance_result
-            overview["raw_positions"] = positions_result
-            overview["raw_orders"] = orders_result
-        return overview
+        return account_service.with_account_raw(
+            overview,
+            include_raw=include_raw,
+            balance_result=balance_result,
+            positions_result=positions_result,
+            orders_result=orders_result,
+        )
 
     def _build_account_response(
         self,
@@ -1141,91 +797,40 @@ class AniuService:
         errors: list[str],
         include_raw: bool,
     ) -> dict[str, Any]:
-        if (
-            balance_result is None
-            and positions_result is None
-            and orders_result is None
-        ):
-            return self._with_account_raw(
-                self._empty_account_overview(errors),
-                include_raw=include_raw,
-                balance_result=balance_result,
-                positions_result=positions_result,
-                orders_result=orders_result,
-            )
-
-        overview = self._build_account_overview(balance_result, positions_result)
-        normalized_orders = self._build_orders_overview(orders_result)
-        overview["orders"] = normalized_orders
-        overview["trade_summaries"] = self._build_trade_summaries(
-            normalized_orders,
-            overview.get("positions") or [],
-        )
-        overview["errors"] = errors
-        return self._with_account_raw(
-            overview,
-            include_raw=include_raw,
+        return account_service.build_account_response(
             balance_result=balance_result,
             positions_result=positions_result,
             orders_result=orders_result,
+            errors=errors,
+            include_raw=include_raw,
         )
 
     def _get_cached_account_overview(self) -> dict[str, Any] | None:
-        with self._account_cache_lock:
-            if (
-                self._account_overview_cache is None
-                or self._account_overview_cache_expires_at is None
-                or self._account_overview_cache_expires_at <= now_utc()
-            ):
-                self._account_overview_cache = None
-                self._account_overview_cache_expires_at = None
-                return None
-
-            return dict(self._account_overview_cache)
+        account_service._account_overview_cache = self._account_overview_cache
+        account_service._account_overview_cache_expires_at = (
+            self._account_overview_cache_expires_at
+        )
+        cached = account_service.get_cached_account_overview()
+        self._sync_account_cache_fields()
+        return cached
 
     def _set_cached_account_overview(self, overview: dict[str, Any]) -> None:
-        ttl_seconds = max(0, int(get_settings().account_overview_cache_ttl_seconds))
-        if ttl_seconds <= 0:
-            with self._account_cache_lock:
-                self._account_overview_cache = None
-                self._account_overview_cache_expires_at = None
-            return
-
-        # Keep debug-only upstream payloads out of the process cache to reduce
-        # steady-state RSS while preserving the normalized account summary.
-        cached_overview = dict(overview)
-        cached_overview.pop("raw_balance", None)
-        cached_overview.pop("raw_positions", None)
-        cached_overview.pop("raw_orders", None)
-
-        with self._account_cache_lock:
-            self._account_overview_cache = cached_overview
-            self._account_overview_cache_expires_at = now_utc() + timedelta(
-                seconds=ttl_seconds
-            )
+        account_service._account_overview_cache = self._account_overview_cache
+        account_service._account_overview_cache_expires_at = (
+            self._account_overview_cache_expires_at
+        )
+        account_service.set_cached_account_overview(overview)
+        self._sync_account_cache_fields()
 
     def _fetch_live_account_payloads(
         self, client: MXClient
     ) -> dict[str, dict[str, Any]]:
-        return {
-            "balance": self._safe_call(client.get_balance),
-            "positions": self._safe_call(client.get_positions),
-            "orders": self._safe_call(client.get_orders),
-        }
+        return account_service.fetch_live_account_payloads(client)
 
     def _extract_tool_result(
         self, tool_calls: list[dict[str, Any]], tool_name: str
     ) -> dict[str, Any] | None:
-        for item in reversed(tool_calls):
-            if item.get("name") != tool_name:
-                continue
-            result = item.get("result")
-            if not isinstance(result, dict) or not result.get("ok"):
-                continue
-            payload = result.get("result")
-            if isinstance(payload, dict):
-                return payload
-        return None
+        return account_service.extract_tool_result(tool_calls, tool_name)
 
     def get_account_overview(
         self,
@@ -1233,138 +838,18 @@ class AniuService:
         include_raw: bool = False,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        if not force_refresh and not include_raw:
-            cached_overview = self._get_cached_account_overview()
-            if cached_overview is not None:
-                return cached_overview
-
-        with session_scope() as db:
-            settings = self.get_or_create_settings(db)
-            cached_balance_result, cached_positions_result, cached_orders_result = (
-                self._get_recent_account_snapshot(db)
-            )
-
-        errors: list[str] = []
-        balance_result = cached_balance_result
-        positions_result = cached_positions_result
-        orders_result = cached_orders_result
-        client: MXClient | None = None
-        mx_client_config = build_skill_context(
-            run_type="chat",
-            app_settings=settings,
-        )["mx_client_config"]
-
-        if mx_client_config.get("api_key"):
-            try:
-                client = MXClient(
-                    api_key=mx_client_config.get("api_key"),
-                    base_url=mx_client_config.get("base_url"),
-                )
-            except Exception as exc:
-                if (
-                    balance_result is None
-                    and positions_result is None
-                    and orders_result is None
-                ):
-                    return self._build_account_response(
-                        balance_result=None,
-                        positions_result=None,
-                        orders_result=None,
-                        errors=[str(exc)],
-                        include_raw=include_raw,
-                    )
-
-                errors.append(f"{str(exc)}，当前展示最近一次任务缓存的账户数据。")
-                overview = self._build_account_response(
-                    balance_result=balance_result,
-                    positions_result=positions_result,
-                    orders_result=orders_result,
-                    errors=errors,
-                    include_raw=include_raw,
-                )
-                return overview
-
-        try:
-            if client is not None:
-                live_payloads = self._fetch_live_account_payloads(client)
-
-                balance_payload = live_payloads["balance"]
-                if not balance_payload.get("ok"):
-                    if cached_balance_result is not None:
-                        balance_result = cached_balance_result
-                        errors.append(
-                            f"{str(balance_payload.get('error') or '资金接口失败')}，当前展示最近一次任务缓存的账户资金。"
-                        )
-                    else:
-                        balance_result = None
-                        errors.append(
-                            str(balance_payload.get("error") or "资金接口失败")
-                        )
-                else:
-                    balance_result = balance_payload.get("result")
-
-                positions_payload = live_payloads["positions"]
-                if not positions_payload.get("ok"):
-                    if cached_positions_result is not None:
-                        positions_result = cached_positions_result
-                        errors.append(
-                            f"{str(positions_payload.get('error') or '持仓接口失败')}，当前展示最近一次任务缓存的持仓数据。"
-                        )
-                    else:
-                        positions_result = None
-                        errors.append(
-                            str(positions_payload.get("error") or "持仓接口失败")
-                        )
-                else:
-                    positions_result = positions_payload.get("result")
-
-                orders_payload = live_payloads["orders"]
-                if not orders_payload.get("ok"):
-                    if cached_orders_result is not None:
-                        orders_result = cached_orders_result
-                        errors.append(
-                            f"{str(orders_payload.get('error') or '委托接口失败')}，当前展示最近一次任务缓存的委托数据。"
-                        )
-                    else:
-                        orders_result = None
-                        errors.append(
-                            str(orders_payload.get("error") or "委托接口失败")
-                        )
-                else:
-                    orders_result = orders_payload.get("result")
-            elif (
-                balance_result is None
-                and positions_result is None
-                and orders_result is None
-            ):
-                return self._build_account_response(
-                    balance_result=None,
-                    positions_result=None,
-                    orders_result=None,
-                    errors=errors
-                    or ["未配置 MX API Key，且没有可用缓存账户数据。"],
-                    include_raw=include_raw,
-                )
-        finally:
-            if client is not None:
-                client.close()
-
-        overview = self._build_account_response(
-            balance_result=balance_result,
-            positions_result=positions_result,
-            orders_result=orders_result,
-            errors=errors,
+        account_service._account_overview_cache = self._account_overview_cache
+        account_service._account_overview_cache_expires_at = (
+            self._account_overview_cache_expires_at
+        )
+        overview = account_service.get_account_overview(
+            settings_loader=self.get_or_create_settings,
+            recent_snapshot_loader=self._get_recent_account_snapshot,
             include_raw=include_raw,
+            force_refresh=force_refresh,
+            client_cls=MXClient,
         )
-        self._set_cached_account_overview(
-            self._build_account_response(
-                balance_result=balance_result,
-                positions_result=positions_result,
-                orders_result=orders_result,
-                errors=errors,
-                include_raw=True,
-            )
-        )
+        self._sync_account_cache_fields()
         return overview
 
     def chat(self, payload: ChatRequest) -> dict[str, Any]:
@@ -1490,237 +975,14 @@ class AniuService:
     def _build_orders_overview(
         self, orders_payload: dict[str, Any] | None
     ) -> list[dict[str, Any]]:
-        orders_source = (
-            orders_payload.get("data") if isinstance(orders_payload, dict) else {}
-        )
-        if isinstance(orders_source, dict):
-            rows = (
-                orders_source.get("rows")
-                or orders_source.get("list")
-                or orders_source.get("orderList")
-                or orders_source.get("orders")
-                or []
-            )
-        else:
-            rows = orders_source or []
-
-        normalized_orders: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-
-            side_value = str(
-                row.get("orderDrt")
-                or row.get("drt")
-                or row.get("bsFlag")
-                or row.get("side")
-                or row.get("tradeType")
-                or ""
-            ).strip()
-            side = "sell" if side_value in {"2", "SELL", "sell"} else "buy"
-
-            status_raw = str(
-                row.get("orderStatus")
-                or row.get("status")
-                or row.get("dbStatus")
-                or "unknown"
-            ).strip()
-
-            raw_symbol = str(
-                row.get("stockCode") or row.get("secCode") or row.get("code") or ""
-            ).strip()
-            market_code = row.get("secMkt")
-            if market_code is None:
-                market_code = row.get("market")
-            suffix = _market_suffix(market_code)
-            symbol = f"{raw_symbol}.{suffix}" if raw_symbol and suffix else raw_symbol
-
-            order_quantity = int(
-                _parse_float(
-                    row.get("orderCount")
-                    or row.get("count")
-                    or row.get("quantity")
-                    or row.get("orderQty")
-                )
-                or 0
-            )
-            filled_quantity = int(
-                _parse_float(
-                    row.get("dealCount")
-                    or row.get("tradeCount")
-                    or row.get("filledQuantity")
-                    or row.get("filledQty")
-                )
-                or 0
-            )
-
-            normalized_orders.append(
-                {
-                    "order_id": str(
-                        row.get("orderId")
-                        or row.get("entrustNo")
-                        or row.get("id")
-                        or "--"
-                    ),
-                    "order_time": _format_timestamp(
-                        row.get("orderTime")
-                        or row.get("entrustTime")
-                        or row.get("time")
-                    ),
-                    "name": str(
-                        row.get("stockName")
-                        or row.get("secName")
-                        or row.get("name")
-                        or "--"
-                    ).strip(),
-                    "symbol": symbol,
-                    "side": side,
-                    "side_text": "卖出" if side == "sell" else "买入",
-                    "status": status_raw.lower(),
-                    "status_text": _order_status_text(
-                        status_raw,
-                        filled_quantity=filled_quantity,
-                        order_quantity=order_quantity,
-                        db_status=row.get("dbStatus"),
-                    ),
-                    "order_price": _scaled_decimal(
-                        row.get("orderPrice") or row.get("price"),
-                        row.get("priceDec") or row.get("orderPriceDec"),
-                    ),
-                    "order_quantity": order_quantity,
-                    "filled_price": _scaled_decimal(
-                        row.get("dealPrice")
-                        or row.get("tradePrice")
-                        or row.get("filledPrice"),
-                        row.get("priceDec") or row.get("dealPriceDec"),
-                    ),
-                    "filled_quantity": filled_quantity,
-                }
-            )
-
-        return normalized_orders
+        return account_service.build_orders_overview(orders_payload)
 
     def _build_trade_summaries(
         self,
         orders: list[dict[str, Any]],
         positions: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        active_symbols = {
-            str(position.get("symbol") or "").strip()
-            for position in positions
-            if isinstance(position, dict)
-            and str(position.get("symbol") or "").strip()
-            and int(_parse_float(position.get("volume")) or 0) > 0
-        }
-
-        grouped_orders: dict[str, list[dict[str, Any]]] = {}
-        for order in orders:
-            if not isinstance(order, dict):
-                continue
-            symbol = str(order.get("symbol") or "").strip()
-            if not symbol:
-                continue
-            grouped_orders.setdefault(symbol, []).append(order)
-
-        summaries: list[dict[str, Any]] = []
-        for symbol, symbol_orders in grouped_orders.items():
-            buy_lots: list[dict[str, Any]] = []
-            matched_quantity = 0
-            matched_buy_amount = 0.0
-            matched_sell_amount = 0.0
-            first_buy_time: str | None = None
-            last_exit_time: str | None = None
-            name = "--"
-
-            sorted_orders = sorted(
-                symbol_orders,
-                key=lambda item: (
-                    str(item.get("order_time") or ""),
-                    str(item.get("order_id") or ""),
-                ),
-            )
-
-            for order in sorted_orders:
-                filled_quantity = int(_parse_float(order.get("filled_quantity")) or 0)
-                if filled_quantity <= 0:
-                    continue
-
-                filled_price = _parse_float(order.get("filled_price"))
-                if filled_price is None or filled_price <= 0:
-                    filled_price = _parse_float(order.get("order_price"))
-                if filled_price is None or filled_price <= 0:
-                    continue
-
-                order_name = str(order.get("name") or "").strip()
-                if order_name:
-                    name = order_name
-
-                if str(order.get("side") or "") == "buy":
-                    order_time = str(order.get("order_time") or "").strip() or None
-                    if first_buy_time is None and order_time:
-                        first_buy_time = order_time
-                    buy_lots.append(
-                        {
-                            "quantity": filled_quantity,
-                            "price": filled_price,
-                            "order_time": order_time,
-                        }
-                    )
-                    continue
-
-                remaining_sell = filled_quantity
-                while remaining_sell > 0 and buy_lots:
-                    lot = buy_lots[0]
-                    lot_quantity = int(lot.get("quantity") or 0)
-                    lot_price = _parse_float(lot.get("price")) or 0.0
-                    if lot_quantity <= 0 or lot_price <= 0:
-                        buy_lots.pop(0)
-                        continue
-
-                    matched = min(remaining_sell, lot_quantity)
-                    matched_quantity += matched
-                    matched_buy_amount += lot_price * matched
-                    matched_sell_amount += filled_price * matched
-                    remaining_sell -= matched
-                    lot["quantity"] = lot_quantity - matched
-                    last_exit_time = (
-                        str(order.get("order_time") or "").strip() or last_exit_time
-                    )
-
-                    if int(lot.get("quantity") or 0) <= 0:
-                        buy_lots.pop(0)
-
-            if matched_quantity <= 0:
-                continue
-            if symbol in active_symbols:
-                continue
-            if any(int(lot.get("quantity") or 0) > 0 for lot in buy_lots):
-                continue
-            if matched_buy_amount <= 0:
-                continue
-
-            profit = matched_sell_amount - matched_buy_amount
-            summaries.append(
-                {
-                    "name": name or symbol,
-                    "symbol": symbol,
-                    "volume": matched_quantity,
-                    "buy_amount": matched_buy_amount,
-                    "sell_amount": matched_sell_amount,
-                    "buy_price": matched_buy_amount / matched_quantity,
-                    "sell_price": matched_sell_amount / matched_quantity,
-                    "profit": profit,
-                    "profit_ratio": profit / matched_buy_amount,
-                    "opened_at": first_buy_time,
-                    "closed_at": last_exit_time,
-                }
-            )
-
-        summaries.sort(
-            key=lambda item: str(item.get("closed_at") or ""),
-            reverse=True,
-        )
-        return summaries
+        return account_service.build_trade_summaries(orders, positions)
 
     def _prepare_run(
         self,
@@ -1802,6 +1064,24 @@ class AniuService:
         session_context: PersistentRunSessionContext | None = None
         automation_phase = "llm"
         _emit = emit if callable(emit) else (lambda *_a, **_kw: None)
+        runtime_context, agent_runner = run_service.build_runtime_context(
+            run_id=run_id,
+            settings_snapshot=settings_snapshot,
+            trigger_source=trigger_source,
+            schedule_id=schedule_id,
+            emit=_emit,
+        )
+
+        def _emit_db(db: Session, event_type: str, **data: Any) -> None:
+            if getattr(emit, "_persist_run_events", False):
+                run_event_publisher.publish(
+                    run_id=run_id,
+                    event_type=event_type,
+                    data=data or None,
+                    db=db,
+                )
+                return
+            _emit(event_type, **data)
 
         try:
             logger.info(
@@ -1810,196 +1090,178 @@ class AniuService:
                 trigger_source,
                 schedule_id,
             )
-            _emit(
-                "stage",
-                stage="started",
+            agent_runner.transition(
+                context=runtime_context,
+                phase="started",
                 message="任务已启动",
                 trigger_source=trigger_source,
                 schedule_id=schedule_id,
             )
-
-            settings = SimpleNamespace(**settings_snapshot)
-            mx_client_config = build_skill_context(
-                run_type=getattr(settings, "run_type", "analysis"),
-                app_settings=settings,
-            )["mx_client_config"]
-            if not mx_client_config.get("api_key"):
-                raise RuntimeError("未配置 MX API Key，请先在设置页保存后再运行。")
-            client = MXClient(
-                api_key=mx_client_config.get("api_key"),
-                base_url=mx_client_config.get("base_url"),
-            )
             try:
-                _emit("stage", stage="llm", message="正在调用大模型")
-                session_context = self._prepare_persistent_session_context(
-                    run_id=run_id,
-                    settings=settings,
+                (
+                    settings,
+                    session_context,
+                    decision,
+                    llm_request,
+                    llm_response,
+                    runtime_trace,
+                ) = run_service.invoke_llm_run(
+                    agent_runner=agent_runner,
+                    runtime_context=runtime_context,
+                    session_scope=session_scope,
+                    prepare_persistent_session_context=self._prepare_persistent_session_context,
+                    llm_runner=llm_service.run_agent_with_messages,
+                    settings_snapshot=settings_snapshot,
                     trigger_source=trigger_source,
                     schedule_id=schedule_id,
+                    build_skill_context=build_skill_context,
+                    mx_client_cls=MXClient,
+                    emit=_emit,
                 )
-                decision, llm_request, llm_response, runtime_trace = (
-                    llm_service.run_agent_with_messages(
-                        app_settings=settings,
-                        client=client,
-                        messages=session_context.messages,
-                        emit=_emit,
-                    )
-                )
-            finally:
-                client.close()
+            except RunInvocationError as run_exc:
+                session_context = run_exc.session_context
+                automation_phase = run_exc.phase
+                raise run_exc.original_exception from run_exc
 
             tool_calls = decision.get("tool_calls")
             skill_payloads = {
                 "tool_calls": tool_calls,
                 "runtime_trace": runtime_trace,
             }
-            executed_actions = self._extract_executed_actions(tool_calls)
+            agent_runner.transition(
+                context=runtime_context,
+                phase="propose",
+                stage="llm",
+                message="正在整理交易提案",
+            )
+            proposals = self._extract_trade_proposals(tool_calls)
+            agent_runner.transition(
+                context=runtime_context,
+                phase="policy_check",
+                stage="policy",
+                message="正在执行策略裁决",
+                proposal_count=len(proposals),
+            )
+            policy_decisions = self._evaluate_trade_proposals(
+                proposals,
+                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
+                trade_enabled=bool(getattr(settings, "trade_enabled", True)),
+                trigger_source=trigger_source,
+            )
+            approved_count = sum(
+                1 for item in policy_decisions if item.decision == "approved"
+            )
+            revised_count = sum(
+                1 for item in policy_decisions if item.decision == "revise"
+            )
+            rejected_count = sum(
+                1 for item in policy_decisions if item.decision == "rejected"
+            )
+            if approved_count:
+                _emit(
+                    "policy_approved",
+                    message="存在可执行提案",
+                    approved_count=approved_count,
+                    revised_count=revised_count,
+                    rejected_count=rejected_count,
+                )
+            if revised_count:
+                agent_runner.transition(
+                    context=runtime_context,
+                    phase="replan",
+                    stage="policy",
+                    message="策略裁决已修正提案",
+                    approved_count=approved_count,
+                    revised_count=revised_count,
+                    rejected_count=rejected_count,
+                )
+                _emit(
+                    "policy_revise_requested",
+                    message="策略裁决修正后继续执行",
+                    revised_count=revised_count,
+                )
+            if rejected_count:
+                _emit(
+                    "policy_rejected",
+                    message="存在被拒绝的提案",
+                    approved_count=approved_count,
+                    revised_count=revised_count,
+                    rejected_count=rejected_count,
+                )
+            executed_intents = intents_from_proposals(policy_decisions)
+            executed_actions = intents_to_records(executed_intents)
             persisted_trade_orders = [
                 {
-                    "symbol": action.get("symbol"),
-                    "action": action.get("action"),
-                    "quantity": action.get("quantity"),
-                    "price": action.get("price"),
-                    "status": action.get("status") or "submitted",
+                    "symbol": intent.symbol,
+                    "action": intent.action,
+                    "quantity": intent.quantity,
+                    "price": intent.price,
+                    "status": intent.status or "submitted",
                 }
-                for action in executed_actions
-                if str(action.get("action") or "") in {"BUY", "SELL"}
+                for intent in executed_intents
+                if str(intent.action or "") in {"BUY", "SELL"}
             ]
             completed_at = now_utc()
             completed_at_shanghai = completed_at.astimezone(SHANGHAI_TZ)
 
             if persisted_trade_orders:
-                _emit(
-                    "stage",
+                agent_runner.transition(
+                    context=runtime_context,
+                    phase="execute",
                     stage="trade",
                     message=f"正在写入交易执行记录（{len(persisted_trade_orders)} 条）",
                 )
-
-            with session_scope() as db:
-                run = db.get(StrategyRun, run_id)
-                if run is None:
-                    raise RuntimeError("运行记录不存在。")
-                run.chat_session_id = session_context.session_id if session_context else None
-                run.prompt_message_id = (
-                    session_context.prompt_message_id if session_context else None
-                )
-                run.context_summary_version = (
-                    session_context.summary_revision if session_context else None
-                )
-                run.context_tokens_estimate = (
-                    session_context.context_tokens_estimate if session_context else None
-                )
-                run.skill_payloads = skill_payloads
-                run.llm_request_payload = llm_request
-                run.llm_response_payload = llm_response
-                run.decision_payload = decision
-                run.analysis_summary = self._build_analysis_summary(
-                    decision.get("final_answer")
-                )
-                run.final_answer = (
-                    str(decision.get("final_answer") or "").strip() or None
-                )
-                run.executed_actions = executed_actions
-                run.status = "completed"
-                run.finished_at = completed_at
-                db.add(run)
-
-                for action in executed_actions:
-                    if str(action.get("action") or "") not in {"BUY", "SELL"}:
-                        continue
-                    db.add(
-                        TradeOrder(
-                            run_id=run_id,
-                            symbol=str(action.get("symbol") or ""),
-                            action=str(action.get("action") or ""),
-                            quantity=int(action.get("quantity") or 0),
-                            price_type=str(action.get("price_type") or "MARKET"),
-                            price=_parse_float(action.get("price")),
-                            status=str(action.get("status") or "submitted"),
-                            response_payload=action.get("response"),
-                        )
+            else:
+                if rejected_count and not approved_count and not revised_count:
+                    agent_runner.transition(
+                        context=runtime_context,
+                        phase="skip",
+                        stage="policy",
+                        message="策略裁决拒绝执行，本轮跳过",
+                        rejected_count=rejected_count,
                     )
+                    _emit(
+                        "skip",
+                        message="策略裁决拒绝执行，本轮跳过",
+                        rejected_count=rejected_count,
+                    )
+                agent_runner.transition(
+                    context=runtime_context,
+                    phase="review",
+                    stage="review",
+                    message="正在整理运行结果",
+                )
 
-                if schedule_id:
-                    schedule = db.get(StrategySchedule, schedule_id)
-                    if schedule is not None:
-                        schedule.last_run_at = completed_at
-                        schedule.retry_count = 0
-                        schedule.retry_after_at = None
-                        schedule.next_run_at = self._compute_next_run_at(
-                            schedule.cron_expression,
-                            from_time=completed_at_shanghai,
-                        )
-                        db.add(schedule)
-
-                if session_context is not None:
-                    session = db.get(ChatSession, session_context.session_id)
-                    if session is not None:
-                        previous_summary_revision = int(session.summary_revision or 0)
-                        assistant_content = self._build_persistent_session_assistant_content(
-                            run_id=run_id,
-                            run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
-                            status="completed",
-                            final_answer=str(decision.get("final_answer") or "").strip()
-                            or None,
-                            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
-                            executed_actions=executed_actions,
-                        )
-                        response_message = self._persist_persistent_session_assistant_message(
-                            db=db,
-                            session=session,
-                            run_id=run_id,
-                            content=assistant_content,
-                            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
-                            status="completed",
-                            meta_payload={
-                                "run_type": str(
-                                    getattr(settings, "run_type", "analysis") or "analysis"
-                                ),
-                                "executed_action_count": len(executed_actions),
-                            },
-                        )
-                        session_context.response_message_id = response_message.id
-                        run.response_message_id = response_message.id
-                        archived_summary, summary_version = (
-                            self._maybe_compact_persistent_session(
-                                db=db,
-                                session=session,
-                                settings=settings,
-                                estimated_tokens=int(
-                                    session_context.context_tokens_estimate or 0
-                                ),
-                            )
-                        )
-                        if (
-                            summary_version is not None
-                            and int(summary_version) > previous_summary_revision
-                            and str(archived_summary or "").strip()
-                        ):
-                            summary_message = self._persist_persistent_session_system_message(
-                                db=db,
-                                session=session,
-                                run_id=run_id,
-                                content="[上下文压缩摘要]\n" + str(archived_summary).strip(),
-                                meta_payload={
-                                    "summary_revision": int(summary_version),
-                                    "last_compacted_run_id": session.last_compacted_run_id,
-                                },
-                            )
-                            _emit(
-                                "context_compacted",
-                                message="已生成上下文压缩摘要",
-                                content=summary_message.content,
-                                summary_revision=int(summary_version),
-                                message_id=summary_message.id,
-                                run_id=run_id,
-                            )
-                        run.context_summary_version = (
-                            int(summary_version)
-                            if summary_version is not None
-                            else run.context_summary_version
-                        )
-                        db.add(run)
+            run_service.persist_successful_run(
+                session_scope=session_scope,
+                run_id=run_id,
+                session_context=session_context,
+                skill_payloads=skill_payloads,
+                llm_request=llm_request,
+                llm_response=llm_response,
+                decision=decision,
+                proposals=proposals_to_records(proposals),
+                policy_decisions=[item.to_record() for item in policy_decisions],
+                executed_actions=executed_actions,
+                schedule_id=schedule_id,
+                completed_at=completed_at,
+                completed_at_shanghai=completed_at_shanghai,
+                build_analysis_summary=self._build_analysis_summary,
+                parse_price=_parse_float,
+                trade_order_cls=TradeOrder,
+                strategy_run_cls=StrategyRun,
+                strategy_schedule_cls=StrategySchedule,
+                chat_session_cls=ChatSession,
+                build_assistant_content=self._build_persistent_session_assistant_content,
+                persist_assistant_message=self._persist_persistent_session_assistant_message,
+                maybe_compact_session=self._maybe_compact_persistent_session,
+                persist_system_message=self._persist_persistent_session_system_message,
+                compute_next_run_at=self._compute_next_run_at,
+                emit_db=_emit_db,
+                settings=settings,
+                tool_calls=tool_calls,
+                return_full_run=return_full_run,
+            )
 
             for action in persisted_trade_orders:
                 _emit(
@@ -2017,11 +1279,6 @@ class AniuService:
                     run_id,
                     len(executed_actions),
                 )
-                _emit(
-                    "completed",
-                    message="任务完成",
-                    actions=len(executed_actions),
-                )
                 return None
 
             with session_scope() as db:
@@ -2033,11 +1290,14 @@ class AniuService:
                     run_id,
                     len(executed_actions),
                 )
-                _emit(
-                    "completed",
+                agent_runner.transition(
+                    context=runtime_context,
+                    phase="completed",
+                    stage="completed",
                     message="任务完成",
                     actions=len(executed_actions),
                 )
+                _emit("completed", message="任务完成", actions=len(executed_actions))
                 return run
         except Exception as exc:
             logger.error(
@@ -2045,81 +1305,27 @@ class AniuService:
                 run_id,
                 exc,
             )
-            with session_scope() as db:
-                run = db.get(StrategyRun, run_id)
-                if run is not None:
-                    run.chat_session_id = (
-                        session_context.session_id if session_context else None
-                    )
-                    run.prompt_message_id = (
-                        session_context.prompt_message_id if session_context else None
-                    )
-                    run.response_message_id = (
-                        session_context.response_message_id if session_context else None
-                    )
-                    run.context_summary_version = (
-                        session_context.summary_revision if session_context else None
-                    )
-                    run.context_tokens_estimate = (
-                        session_context.context_tokens_estimate
-                        if session_context
-                        else None
-                    )
-                    run.status = "failed"
-                    run.error_message = str(exc)
-                    run.final_answer = None
-                    run.finished_at = now_utc()
-                    db.add(run)
-                    if session_context is not None:
-                        session = db.get(ChatSession, session_context.session_id)
-                        if session is not None:
-                            assistant_content = self._build_persistent_session_assistant_content(
-                                run_id=run_id,
-                                run_type=str(settings_snapshot.get("run_type") or "analysis"),
-                                status="failed",
-                                final_answer=None,
-                                tool_calls=None,
-                                executed_actions=None,
-                                error_message=str(exc),
-                                phase=automation_phase,
-                            )
-                            response_message = self._persist_persistent_session_assistant_message(
-                                db=db,
-                                session=session,
-                                run_id=run_id,
-                                content=assistant_content,
-                                tool_calls=None,
-                                status="failed",
-                                meta_payload={
-                                    "phase": automation_phase,
-                                    "run_type": str(
-                                        settings_snapshot.get("run_type") or "analysis"
-                                    ),
-                                },
-                            )
-                            run.response_message_id = response_message.id
-                            session_context.response_message_id = response_message.id
-                            db.add(run)
-                if schedule_id:
-                    schedule = db.get(StrategySchedule, schedule_id)
-                    if schedule is not None:
-                        schedule.last_run_at = now_utc()
-                        schedule.next_run_at = self._compute_next_run_at(
-                            schedule.cron_expression,
-                            from_time=now_shanghai(),
-                        )
-                        if trigger_source == "schedule":
-                            retry_count = max(int(schedule.retry_count or 0), 0)
-                            if retry_count < SCHEDULE_MAX_RETRIES:
-                                schedule.retry_count = retry_count + 1
-                                schedule.retry_after_at = now_utc() + SCHEDULE_RETRY_DELAY
-                            else:
-                                schedule.retry_count = 0
-                                schedule.retry_after_at = None
-                        else:
-                            schedule.retry_count = max(int(schedule.retry_count or 0), 0)
-                        db.add(schedule)
-            _emit("failed", message=str(exc))
+            run_service.persist_failed_run(
+                session_scope=session_scope,
+                run_id=run_id,
+                session_context=session_context,
+                schedule_id=schedule_id,
+                trigger_source=trigger_source,
+                settings_snapshot=settings_snapshot,
+                automation_phase=automation_phase,
+                error=exc,
+                now_utc=now_utc,
+                now_shanghai=now_shanghai,
+                compute_next_run_at=self._compute_next_run_at,
+                schedule_max_retries=SCHEDULE_MAX_RETRIES,
+                schedule_retry_delay=SCHEDULE_RETRY_DELAY,
+                strategy_run_cls=StrategyRun,
+                strategy_schedule_cls=StrategySchedule,
+                chat_session_cls=ChatSession,
+                build_assistant_content=self._build_persistent_session_assistant_content,
+                persist_assistant_message=self._persist_persistent_session_assistant_message,
+                emit_db=_emit_db,
+            )
             raise
 
     def execute_run(
@@ -2128,22 +1334,11 @@ class AniuService:
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
     ) -> StrategyRun:
-        if not self._run_lock.acquire(blocking=False):
-            raise RuntimeError("已有运行中的任务，请稍后再试。")
-        try:
-            run_id, settings_snapshot = self._prepare_run(
-                trigger_source,
-                schedule_id,
-                manual_run_type,
-            )
-            return self._run_body(
-                run_id=run_id,
-                settings_snapshot=settings_snapshot,
-                trigger_source=trigger_source,
-                schedule_id=schedule_id,
-            )
-        finally:
-            self._run_lock.release()
+        return run_service.execute_run(
+            trigger_source=trigger_source,
+            schedule_id=schedule_id,
+            manual_run_type=manual_run_type,
+        )
 
     def start_run_async(
         self,
@@ -2151,98 +1346,14 @@ class AniuService:
         schedule_id: int | None = None,
         manual_run_type: str | None = None,
     ) -> int:
-        """Launch a run on a background thread and return its run_id immediately.
-
-        Event stream: subscribe via ``event_bus`` using the returned run_id.
-        """
-        if not self._run_lock.acquire(blocking=False):
-            raise RuntimeError("已有运行中的任务，请稍后再试。")
-
-        run_id: int | None = None
-        try:
-            run_id, settings_snapshot = self._prepare_run(
-                trigger_source,
-                schedule_id,
-                manual_run_type,
-            )
-        except Exception:
-            self._run_lock.release()
-            raise
-
-        emit = make_emitter(run_id)
-
-        def _worker() -> None:
-            try:
-                self._run_body(
-                    run_id=run_id,
-                    settings_snapshot=settings_snapshot,
-                    trigger_source=trigger_source,
-                    schedule_id=schedule_id,
-                    emit=emit,
-                    return_full_run=False,
-                )
-            except Exception:
-                logger.exception("async run worker failed: run_id=%s", run_id)
-            finally:
-                self._run_lock.release()
-
-        Thread(
-            target=_worker,
-            name=f"run-{run_id}",
-            daemon=True,
-        ).start()
-        return run_id
+        return run_service.start_run_async(
+            trigger_source=trigger_source,
+            schedule_id=schedule_id,
+            manual_run_type=manual_run_type,
+        )
 
     def process_due_schedule(self) -> None:
-        due_schedule_id: int | None = None
-        with session_scope() as db:
-            schedules = self.list_schedules(db)
-            now = now_shanghai()
-            earliest_due_at: datetime | None = None
-            for schedule in schedules:
-                if not schedule.enabled:
-                    continue
-                if schedule.next_run_at is None:
-                    schedule.next_run_at = self._compute_next_run_at(
-                        schedule.cron_expression
-                    )
-                    db.add(schedule)
-                    continue
-                if not trading_calendar_service.is_trading_day(now.date()):
-                    schedule.next_run_at = self._compute_next_run_at(
-                        schedule.cron_expression,
-                        from_time=now,
-                    )
-                    db.add(schedule)
-                    continue
-                retry_after_at = _assume_utc(schedule.retry_after_at)
-                if retry_after_at is not None:
-                    retry_due = retry_after_at.astimezone(SHANGHAI_TZ)
-                    if retry_due <= now:
-                        if earliest_due_at is None or retry_due < earliest_due_at:
-                            earliest_due_at = retry_due
-                            due_schedule_id = schedule.id
-                        continue
-                if (
-                    schedule.next_run_at is not None
-                    and schedule.next_run_at.astimezone(SHANGHAI_TZ) <= now
-                ):
-                    schedule_due = schedule.next_run_at.astimezone(SHANGHAI_TZ)
-                    if earliest_due_at is None or schedule_due < earliest_due_at:
-                        earliest_due_at = schedule_due
-                        due_schedule_id = schedule.id
-
-        if due_schedule_id is not None:
-            try:
-                self.execute_run(trigger_source="schedule", schedule_id=due_schedule_id)
-            except RuntimeError as exc:
-                if "已有运行中的任务" in str(exc):
-                    logger.info(
-                        "process_due_schedule skipped because another run is active: schedule_id=%s",
-                        due_schedule_id,
-                    )
-                    return
-                raise
+        run_service.process_due_schedule()
 
     def _safe_call(self, func: Any) -> dict[str, Any]:
         try:
@@ -2257,34 +1368,10 @@ class AniuService:
         dict[str, Any] | None,
         dict[str, Any] | None,
     ]:
-        stmt = select(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(20)
-
-        balance_result: dict[str, Any] | None = None
-        positions_result: dict[str, Any] | None = None
-        orders_result: dict[str, Any] | None = None
-
-        for run in db.scalars(stmt).all():
-            tool_calls = self._get_run_tool_calls(run)
-            if not tool_calls:
-                continue
-
-            if balance_result is None:
-                balance_result = self._extract_tool_result(tool_calls, "mx_get_balance")
-            if positions_result is None:
-                positions_result = self._extract_tool_result(
-                    tool_calls, "mx_get_positions"
-                )
-            if orders_result is None:
-                orders_result = self._extract_tool_result(tool_calls, "mx_get_orders")
-
-            if (
-                balance_result is not None
-                and positions_result is not None
-                and orders_result is not None
-            ):
-                break
-
-        return balance_result, positions_result, orders_result
+        return account_service.get_recent_account_snapshot(
+            db,
+            tool_call_loader=self._get_run_tool_calls,
+        )
 
     def _get_run_tool_calls(self, run: StrategyRun) -> list[dict[str, Any]]:
         skill_payloads = (
@@ -2308,11 +1395,11 @@ class AniuService:
             )
         return combined_tool_calls
 
-    def _extract_executed_actions(self, tool_calls: Any) -> list[dict[str, Any]]:
+    def _extract_trade_proposals(self, tool_calls: Any) -> list[TradeProposal]:
         if not isinstance(tool_calls, list):
             return []
 
-        executed_actions: list[dict[str, Any]] = []
+        proposals: list[TradeProposal] = []
         for item in tool_calls:
             if not isinstance(item, dict):
                 continue
@@ -2323,30 +1410,53 @@ class AniuService:
             if not isinstance(executed_action, dict):
                 continue
             action_name = str(executed_action.get("action") or "").upper()
-            entry = {
-                "symbol": str(
+            entry = TradeProposal(
+                symbol=str(
                     executed_action.get("symbol")
                     or executed_action.get("stock_code")
                     or ""
                 ).strip(),
-                "name": str(executed_action.get("name") or "").strip() or None,
-                "action": action_name,
-                "quantity": int(executed_action.get("quantity") or 0),
-                "price_type": str(executed_action.get("price_type") or "MARKET"),
-                "price": executed_action.get("price"),
-                "reason": str(executed_action.get("reason") or "").strip(),
-                "status": "submitted",
-                "response": result.get("result"),
-            }
+                name=str(executed_action.get("name") or "").strip() or None,
+                action=action_name,  # type: ignore[arg-type]
+                quantity=int(executed_action.get("quantity") or 0),
+                price_type=str(executed_action.get("price_type") or "MARKET"),
+                price=_parse_float(executed_action.get("price")),
+                reason=str(executed_action.get("reason") or "").strip(),
+                response=result.get("result") if isinstance(result.get("result"), dict) else None,
+            )
             if action_name == "CANCEL":
-                entry["price_type"] = "CANCEL"
-                entry["status"] = "cancel_requested"
+                entry.price_type = "CANCEL"
             if action_name == "MANAGE_SELF_SELECT":
-                entry["price_type"] = "SELF_SELECT"
-                entry["status"] = "completed"
-                entry["symbol"] = str(executed_action.get("query") or "")
-            executed_actions.append(entry)
-        return executed_actions
+                entry.price_type = "SELF_SELECT"
+                entry.symbol = str(executed_action.get("query") or "")
+            proposals.append(entry)
+        return proposals
+
+    def _evaluate_trade_proposals(
+        self,
+        proposals: list[TradeProposal],
+        *,
+        run_type: str,
+        trade_enabled: bool,
+        trigger_source: str,
+    ) -> list[PolicyDecision]:
+        enforce_trade_run_type = not (
+            trigger_source == "manual" and run_type == "analysis"
+        )
+        return [
+            risk_gate.evaluate(
+                proposal=proposal,
+                run_type=run_type,
+                trade_enabled=trade_enabled,
+                enforce_trade_run_type=enforce_trade_run_type,
+            )
+            for proposal in proposals
+        ]
+
+    def _extract_executed_actions(self, tool_calls: Any) -> list[TradeExecutionIntent]:
+        return intents_from_proposals(
+            self._evaluate_trade_proposals(self._extract_trade_proposals(tool_calls))
+        )
 
     def _build_analysis_summary(self, final_answer: Any) -> str | None:
         text = str(final_answer or "").strip()
@@ -2360,124 +1470,22 @@ class AniuService:
     def _prepare_persistent_session_context(
         self,
         *,
+        db: Session,
         run_id: int,
         settings: Any,
         trigger_source: str,
         schedule_id: int | None,
     ) -> PersistentRunSessionContext:
-        with session_scope() as db:
-            session = self._get_or_create_persistent_session(db)
-            user_content = self._build_persistent_session_user_content(
-                settings=settings,
-                trigger_source=trigger_source,
-                schedule_id=schedule_id,
-                schedule_name=getattr(settings, "schedule_name", None),
-                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
-                task_prompt=str(getattr(settings, "task_prompt", "") or ""),
-                prefetched_context=None,
-            )
-            user_message = self._persist_persistent_session_user_message(
-                db=db,
-                session=session,
-                run_id=run_id,
-                content=user_content,
-                schedule_id=schedule_id,
-                schedule_name=getattr(settings, "schedule_name", None),
-                run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
-                trigger_source=trigger_source,
-            )
-            history_records = self._list_persistent_session_history_records(
-                db=db,
-                session_id=session.id,
-                recent_limit=int(
-                    getattr(settings, "automation_recent_message_limit", 0)
-                    or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
-                ),
-            )
-            history_messages = self._build_persistent_session_history_messages(
-                history_records
-            )
-            messages = self._build_persistent_session_prompt_messages(
-                session=session,
-                history_messages=history_messages,
-                memory_messages=self._retrieve_persistent_session_memory_messages(
-                    session=session,
-                    settings=settings,
-                    run_type=str(getattr(settings, "run_type", "analysis") or "analysis"),
-                    task_prompt=str(getattr(settings, "task_prompt", "") or ""),
-                ),
-            )
-            context_tokens_estimate = self._estimate_persistent_session_context_tokens(
-                session=session,
-                settings=settings,
-                messages=messages,
-            )
-            context_tokens_estimate = max(
-                context_tokens_estimate,
-                estimate_messages_tokens(history_messages),
-            )
-            with db.no_autoflush:
-                run = db.get(StrategyRun, run_id)
-                if run is not None:
-                    run.chat_session_id = session.id
-                    run.prompt_message_id = user_message.id
-                    run.context_tokens_estimate = context_tokens_estimate
-                    run.context_summary_version = int(session.summary_revision or 0)
-                    db.add(run)
-
-            return PersistentRunSessionContext(
-                session_id=session.id,
-                prompt_message_id=user_message.id,
-                response_message_id=None,
-                summary_revision=int(session.summary_revision or 0),
-                context_tokens_estimate=context_tokens_estimate,
-                messages=messages,
-            )
+        return automation_session_service.prepare_persistent_session_context(
+            db=db,
+            run_id=run_id,
+            settings=settings,
+            trigger_source=trigger_source,
+            schedule_id=schedule_id,
+        )
 
     def _get_or_create_persistent_session(self, db: Session) -> ChatSession:
-        settings = self.get_or_create_settings(db)
-        session_id = int(getattr(settings, "automation_session_id", 0) or 0)
-        if session_id > 0:
-            existing = db.get(ChatSession, session_id)
-            if existing is not None and str(existing.kind or "") == "automation":
-                return existing
-
-        session = db.scalar(
-            select(ChatSession).where(
-                ChatSession.kind == "automation",
-                ChatSession.slug == AUTOMATION_SESSION_SLUG,
-            )
-        )
-        if session is None:
-            session = ChatSession(
-                title=AUTOMATION_SESSION_TITLE,
-                kind="automation",
-                slug=AUTOMATION_SESSION_SLUG,
-            )
-            db.add(session)
-            db.flush()
-
-        settings.automation_session_id = session.id
-        settings.automation_context_window_tokens = int(
-            getattr(settings, "automation_context_window_tokens", None)
-            or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
-        )
-        settings.automation_recent_message_limit = int(
-            getattr(settings, "automation_recent_message_limit", None)
-            or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
-        )
-        settings.automation_idle_summary_hours = int(
-            getattr(settings, "automation_idle_summary_hours", None)
-            or AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS
-        )
-        settings.automation_context_source = (
-            str(getattr(settings, "automation_context_source", "") or "").strip()
-            or "default"
-        )
-        settings.automation_context_detected_at = now_utc()
-        if hasattr(settings, "_sa_instance_state"):
-            db.add(settings)
-        return session
+        return automation_session_service.get_or_create_persistent_session(db)
 
     def _build_persistent_session_user_content(
         self,
@@ -2490,27 +1498,15 @@ class AniuService:
         task_prompt: str,
         prefetched_context: str | None,
     ) -> str:
-        current_time = now_shanghai()
-        run_time = (
-            f"{current_time.year}年{current_time.month}月{current_time.day}日 "
-            f"{current_time.strftime('%H:%M:%S')}"
+        return automation_session_service.build_persistent_session_user_content(
+            settings=settings,
+            trigger_source=trigger_source,
+            schedule_id=schedule_id,
+            schedule_name=schedule_name,
+            run_type=run_type,
+            task_prompt=task_prompt,
+            prefetched_context=prefetched_context,
         )
-        trigger_source_text = (
-            "定时触发" if str(trigger_source or "").strip() == "schedule" else "手动触发"
-        )
-        task_type_text = (
-            "交易任务" if str(run_type or "").strip() == "trade" else "分析任务"
-        )
-        lines = [
-            f"时间：{run_time}",
-            f"来源: {trigger_source_text}",
-            f"任务类型: {task_type_text}",
-            "",
-            "本轮任务:",
-            str(task_prompt or "").strip() or "--",
-        ]
-        del settings, schedule_name, prefetched_context
-        return "\n".join(lines).strip()
 
     def _build_persistent_session_assistant_content(
         self,
@@ -2524,14 +1520,16 @@ class AniuService:
         error_message: str | None = None,
         phase: str | None = None,
     ) -> str:
-        content = str(final_answer or "").strip()
-
-        if status == "completed":
-            del executed_actions, tool_calls, run_id, run_type
-            return content or "本轮已完成，但未生成额外说明。"
-
-        del executed_actions, tool_calls, run_id, run_type, phase
-        return f"执行失败：{str(error_message or '未知错误').strip() or '未知错误'}"
+        return automation_session_service.build_persistent_session_assistant_content(
+            run_id=run_id,
+            run_type=run_type,
+            status=status,
+            final_answer=final_answer,
+            tool_calls=tool_calls,
+            executed_actions=executed_actions,
+            error_message=error_message,
+            phase=phase,
+        )
 
     def _persist_persistent_session_user_message(
         self,
@@ -2545,48 +1543,21 @@ class AniuService:
         run_type: str,
         trigger_source: str,
     ) -> ChatMessageRecord:
-        record = ChatMessageRecord(
-            session_id=session.id,
-            role="user",
-            content=content,
-            source="automation_run",
+        return automation_session_service.persist_persistent_session_user_message(
+            db=db,
+            session=session,
             run_id=run_id,
-            message_kind="live_turn",
-            meta_payload={
-                "trigger_source": trigger_source,
-                "schedule_id": schedule_id,
-                "schedule_name": schedule_name,
-                "run_type": run_type,
-            },
+            content=content,
+            schedule_id=schedule_id,
+            schedule_name=schedule_name,
+            run_type=run_type,
+            trigger_source=trigger_source,
         )
-        db.add(record)
-        db.flush()
-        session.last_message_at = now_utc()
-        db.add(session)
-        return record
 
     def _slim_automation_tool_calls(
         self, tool_calls: list[dict[str, Any]] | None
     ) -> list[dict[str, Any]] | None:
-        if not isinstance(tool_calls, list):
-            return None
-        slimmed: list[dict[str, Any]] = []
-        for item in tool_calls:
-            if not isinstance(item, dict):
-                continue
-            result = item.get("result") if isinstance(item.get("result"), dict) else {}
-            entry = {
-                "name": item.get("name"),
-                "tool_call_id": item.get("id") or item.get("tool_call_id"),
-                "arguments": item.get("arguments"),
-                "ok": result.get("ok"),
-                "summary": result.get("summary") or result.get("error"),
-            }
-            executed_action = result.get("executed_action")
-            if isinstance(executed_action, dict):
-                entry["executed_action"] = executed_action
-            slimmed.append(entry)
-        return slimmed or None
+        return automation_session_service.slim_automation_tool_calls(tool_calls)
 
     def _persist_persistent_session_assistant_message(
         self,
@@ -2599,21 +1570,15 @@ class AniuService:
         status: str,
         meta_payload: dict[str, Any] | None,
     ) -> ChatMessageRecord:
-        record = ChatMessageRecord(
-            session_id=session.id,
-            role="assistant",
-            content=content,
-            source="automation_run",
+        return automation_session_service.persist_persistent_session_assistant_message(
+            db=db,
+            session=session,
             run_id=run_id,
-            message_kind="live_turn",
-            tool_calls=self._slim_automation_tool_calls(tool_calls),
-            meta_payload={"status": status, **(meta_payload or {})} or None,
+            content=content,
+            tool_calls=tool_calls,
+            status=status,
+            meta_payload=meta_payload,
         )
-        db.add(record)
-        db.flush()
-        session.last_message_at = now_utc()
-        db.add(session)
-        return record
 
     def _persist_persistent_session_system_message(
         self,
@@ -2624,20 +1589,13 @@ class AniuService:
         content: str,
         meta_payload: dict[str, Any] | None,
     ) -> ChatMessageRecord:
-        record = ChatMessageRecord(
-            session_id=session.id,
-            role="system",
-            content=content,
-            source="automation_run",
+        return automation_session_service.persist_persistent_session_system_message(
+            db=db,
+            session=session,
             run_id=run_id,
-            message_kind="context_compaction",
-            meta_payload=meta_payload or None,
+            content=content,
+            meta_payload=meta_payload,
         )
-        db.add(record)
-        db.flush()
-        session.last_message_at = now_utc()
-        db.add(session)
-        return record
 
     def _list_persistent_session_history_records(
         self,
@@ -2646,43 +1604,16 @@ class AniuService:
         session_id: int,
         recent_limit: int,
     ) -> list[ChatMessageRecord]:
-        limit = max(4, int(recent_limit or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT))
-        session = db.get(ChatSession, session_id)
-        last_compacted_message_id = int(
-            getattr(session, "last_compacted_message_id", 0) or 0
+        return automation_session_service.list_persistent_session_history_records(
+            db=db,
+            session_id=session_id,
+            recent_limit=recent_limit,
         )
-        stmt = (
-            select(ChatMessageRecord)
-            .where(ChatMessageRecord.session_id == session_id)
-            .order_by(ChatMessageRecord.id.desc())
-            .limit(limit)
-        )
-        if last_compacted_message_id > 0:
-            stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
-        records = (
-            db.execute(
-                stmt
-            )
-            .scalars()
-            .all()
-        )
-        records.reverse()
-        return records
 
     def _build_persistent_session_history_messages(
         self, records: list[ChatMessageRecord]
     ) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        for record in records:
-            if str(record.message_kind or "").strip() == "context_compaction":
-                continue
-            if record.role not in {"user", "assistant", "system"}:
-                continue
-            content = str(record.content or "").strip()
-            if not content:
-                continue
-            messages.append({"role": record.role, "content": content})
-        return messages
+        return automation_session_service.build_persistent_session_history_messages(records)
 
     def _retrieve_persistent_session_memory_messages(
         self,
@@ -2692,10 +1623,12 @@ class AniuService:
         run_type: str,
         task_prompt: str,
     ) -> list[dict[str, Any]]:
-        # Placeholder hook for future vector retrieval. Keep the contract stable
-        # so long-term memory can be injected without reshaping the main run flow.
-        del session, settings, run_type, task_prompt
-        return []
+        return automation_session_service.retrieve_persistent_session_memory_messages(
+            session=session,
+            settings=settings,
+            run_type=run_type,
+            task_prompt=task_prompt,
+        )
 
     def _estimate_persistent_session_context_tokens(
         self,
@@ -2704,9 +1637,11 @@ class AniuService:
         settings: Any,
         messages: list[dict[str, Any]],
     ) -> int:
-        estimate = estimate_messages_tokens(messages)
-        estimate += estimate_text_tokens(getattr(settings, "system_prompt", None))
-        return estimate
+        return automation_session_service.estimate_persistent_session_context_tokens(
+            session=session,
+            settings=settings,
+            messages=messages,
+        )
 
     def _list_uncompacted_persistent_session_records(
         self,
@@ -2714,27 +1649,19 @@ class AniuService:
         db: Session,
         session: ChatSession,
     ) -> list[ChatMessageRecord]:
-        stmt = (
-            select(ChatMessageRecord)
-            .where(ChatMessageRecord.session_id == session.id)
-            .order_by(ChatMessageRecord.id.asc())
+        return automation_session_service.list_uncompacted_persistent_session_records(
+            db=db,
+            session=session,
         )
-        last_compacted_message_id = int(
-            getattr(session, "last_compacted_message_id", 0) or 0
-        )
-        if last_compacted_message_id > 0:
-            stmt = stmt.where(ChatMessageRecord.id > last_compacted_message_id)
-        return db.execute(stmt).scalars().all()
 
     def _build_persistent_session_context_system_message(
         self,
         *,
         session: ChatSession,
     ) -> dict[str, Any] | None:
-        archived_summary = str(session.archived_summary or "").strip()
-        if not archived_summary:
-            return None
-        return {"role": "system", "content": "[上下文压缩摘要]\n" + archived_summary}
+        return automation_session_service.build_persistent_session_context_system_message(
+            session=session,
+        )
 
     def _build_persistent_session_prompt_messages(
         self,
@@ -2743,52 +1670,19 @@ class AniuService:
         history_messages: list[dict[str, Any]],
         memory_messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = []
-        context_message = self._build_persistent_session_context_system_message(
+        return automation_session_service.build_persistent_session_prompt_messages(
             session=session,
+            history_messages=history_messages,
+            memory_messages=memory_messages,
         )
-        if context_message is not None:
-            messages.append(context_message)
-        messages.extend(memory_messages)
-        messages.extend(history_messages)
-        return messages
 
     def _build_compacted_summary_text(
         self, records: list[ChatMessageRecord]
     ) -> str | None:
-        if not records:
-            return None
-        assistant_records = [record for record in records if record.role == "assistant"]
-        if not assistant_records:
-            return None
-        recent = assistant_records[-6:]
-        lines = [
-            "## 当前策略",
-            "- 结合最近自动化运行的结论、失败记录和账户快照继续决策。",
-            "## 已执行动作",
-        ]
-        for record in recent:
-            summary = self._build_analysis_summary(record.content)
-            run_id = record.run_id if record.run_id is not None else "--"
-            if summary:
-                lines.append(f"- run_id {run_id}: {summary}")
-        lines.extend(
-            [
-                "## 当前约束",
-                "- 原始运行记录和交易记录以 StrategyRun / TradeOrder 为准。",
-                "- 账户实时数字应以本轮最新快照和工具结果为准。",
-                "## 后续计划",
-                "- 下一轮结合最新账户快照，延续、调整或推翻之前计划。",
-            ]
-        )
-        return "\n".join(lines)
+        return automation_session_service.build_compacted_summary_text(records)
 
     def _safe_prompt_budget(self, settings: Any) -> int:
-        context_window = int(
-            getattr(settings, "automation_context_window_tokens", 0)
-            or AUTOMATION_DEFAULT_CONTEXT_WINDOW_TOKENS
-        )
-        return max(2048, int(context_window * AUTOMATION_COMPACTION_TRIGGER_RATIO))
+        return automation_session_service.safe_prompt_budget(settings)
 
     def _should_compact_automation_session(
         self,
@@ -2798,25 +1692,12 @@ class AniuService:
         settings: Any,
         estimated_tokens: int,
     ) -> bool:
-        if not bool(getattr(settings, "automation_enable_auto_compaction", True)):
-            return False
-        recent_limit = int(
-            getattr(settings, "automation_recent_message_limit", 0)
-            or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
+        return automation_session_service.should_compact_automation_session(
+            session=session,
+            records=records,
+            settings=settings,
+            estimated_tokens=estimated_tokens,
         )
-        if len(records) > recent_limit:
-            return True
-        if estimated_tokens > self._safe_prompt_budget(settings):
-            return True
-        last_message_at = _assume_utc(session.last_message_at)
-        idle_hours = int(
-            getattr(settings, "automation_idle_summary_hours", 0)
-            or AUTOMATION_DEFAULT_IDLE_SUMMARY_HOURS
-        )
-        if last_message_at is not None and idle_hours > 0:
-            if now_utc() - last_message_at >= timedelta(hours=idle_hours):
-                return True
-        return False
 
     def _maybe_compact_persistent_session(
         self,
@@ -2826,106 +1707,20 @@ class AniuService:
         settings: Any,
         estimated_tokens: int,
     ) -> tuple[str | None, int | None]:
-        records = self._list_uncompacted_persistent_session_records(
+        return automation_session_service.maybe_compact_persistent_session(
             db=db,
             session=session,
-        )
-        if not self._should_compact_automation_session(
-            session=session,
-            records=records,
             settings=settings,
             estimated_tokens=estimated_tokens,
-        ):
-            return session.archived_summary, session.summary_revision
-
-        recent_limit = max(
-            8,
-            int(
-                getattr(settings, "automation_recent_message_limit", 0)
-                or AUTOMATION_DEFAULT_RECENT_MESSAGE_LIMIT
-            )
-            // 2,
         )
-        compact_cutoff = max(0, len(records) - recent_limit)
-        compact_candidates = records[:compact_cutoff]
-        if len(compact_candidates) < 2:
-            return session.archived_summary, session.summary_revision
-        if len(compact_candidates) % 2 == 1:
-            compact_candidates = compact_candidates[:-1]
-        if len(compact_candidates) < 2:
-            return session.archived_summary, session.summary_revision
-
-        summary = self._build_compacted_summary_text(compact_candidates)
-        if not summary:
-            return session.archived_summary, session.summary_revision
-
-        session.archived_summary = summary
-        session.summary_updated_at = now_utc()
-        session.last_compacted_message_id = compact_candidates[-1].id
-        last_run_id = compact_candidates[-1].run_id
-        session.last_compacted_run_id = int(last_run_id) if last_run_id else None
-        session.summary_revision = int(session.summary_revision or 0) + 1
-        db.add(session)
-        return session.archived_summary, session.summary_revision
 
     def _compute_next_run_at(
         self,
         cron_expression: str | None,
         from_time: datetime | None = None,
     ) -> datetime | None:
-        if not cron_expression:
-            return None
-
-        parts = cron_expression.strip().split()
-        if len(parts) != 5:
-            return None
-
-        minute_expr, hour_expr, day_of_month_expr, month_expr, day_of_week_expr = parts
-        try:
-            minute_values = self._parse_cron_values(minute_expr, 0, 59)
-            hour_values = self._parse_cron_values(hour_expr, 0, 23)
-            day_of_month_values = self._parse_cron_values(day_of_month_expr, 1, 31)
-            month_values = self._parse_cron_values(month_expr, 1, 12)
-            day_of_week_values = self._parse_cron_values(
-                day_of_week_expr,
-                0,
-                6,
-                allow_seven_as_zero=True,
-            )
-        except ValueError:
-            return None
-
-        current_base = from_time or now_shanghai()
-        if current_base.tzinfo is None:
-            current_base = current_base.replace(tzinfo=SHANGHAI_TZ)
-        else:
-            current_base = current_base.astimezone(SHANGHAI_TZ)
-
-        current = current_base.replace(second=0, microsecond=0) + timedelta(minutes=1)
-
-        for _ in range(60 * 24 * 366 * 2):
-            if not trading_calendar_service.is_trading_day(current.date()):
-                next_day = trading_calendar_service.next_trading_day(current.date())
-                current = datetime.combine(
-                    next_day, datetime.min.time(), tzinfo=SHANGHAI_TZ
-                )
-                continue
-
-            if (
-                current.minute in minute_values
-                and current.hour in hour_values
-                and current.month in month_values
-                and self._matches_cron_day(
-                    current,
-                    day_of_month_values=day_of_month_values,
-                    day_of_week_values=day_of_week_values,
-                    day_of_month_expr=day_of_month_expr,
-                    day_of_week_expr=day_of_week_expr,
-                )
-            ):
-                return current.astimezone(timezone.utc)
-            current += timedelta(minutes=1)
-        return None
+        effective_from_time = from_time if from_time is not None else now_shanghai()
+        return compute_next_run_at(cron_expression, from_time=effective_from_time)
 
     def _parse_cron_values(
         self,
@@ -3026,223 +1821,15 @@ class AniuService:
         balance_payload: dict[str, Any] | None,
         positions_payload: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        balance = (
-            balance_payload.get("data") if isinstance(balance_payload, dict) else {}
-        )
-        positions_source = (
-            positions_payload.get("data") if isinstance(positions_payload, dict) else []
-        )
-        if isinstance(positions_source, dict):
-            rows = (
-                positions_source.get("data")
-                or positions_source.get("rows")
-                or positions_source.get("list")
-                or positions_source.get("posList")
-                or []
-            )
-        else:
-            rows = positions_source or []
-
-        total_assets = None
-        total_market_value = None
-        holding_profit = None
-        daily_profit = None
-        daily_profit_trade_date = None
-        open_date = None
-        operating_days = None
-        initial_capital = None
-        cash_balance = None
-        total_position_ratio = None
-        nav = None
-        if isinstance(balance, dict):
-            open_date = _format_open_date(balance.get("openDate"))
-            operating_days = int(_parse_float(balance.get("oprDays")) or 0) or None
-            initial_capital = _parse_float(balance.get("initMoney"))
-            total_assets = _parse_float(
-                balance.get("totalAsset")
-                or balance.get("totalAssets")
-                or balance.get("asset")
-                or balance.get("totalMoney")
-                or (
-                    (balance.get("result") or {}).get("totalAssets")
-                    if isinstance(balance.get("result"), dict)
-                    else None
-                )
-            )
-            total_market_value = _parse_float(
-                balance.get("marketValue")
-                or balance.get("stockMarketValue")
-                or balance.get("positionValue")
-                or balance.get("totalPosValue")
-            )
-            cash_balance = _parse_float(
-                balance.get("balanceActual")
-                or balance.get("availBalance")
-                or balance.get("cashBalance")
-            )
-            total_position_ratio = _normalize_percent(
-                _parse_float(balance.get("totalPosPct"))
-            )
-            holding_profit = _parse_float(
-                balance.get("holdingProfit")
-                or balance.get("positionProfit")
-                or balance.get("floatProfit")
-                or balance.get("totalProfit")
-            )
-            nav = _parse_float(balance.get("nav"))
-            daily_profit = _parse_float(
-                balance.get("todayProfit")
-                or balance.get("dailyProfit")
-                or balance.get("profitToday")
-            )
-            raw_trade_date = (
-                balance.get("tradeDate")
-                or balance.get("tradingDate")
-                or balance.get("date")
-                or balance.get("profitDate")
-            )
-            if raw_trade_date:
-                text = str(raw_trade_date).strip()
-                if len(text) == 8 and text.isdigit():
-                    daily_profit_trade_date = f"{text[:4]}-{text[4:6]}-{text[6:8]}"
-                elif len(text) >= 10:
-                    daily_profit_trade_date = text[:10]
-
-        if holding_profit is None and isinstance(positions_source, dict):
-            holding_profit = _parse_float(positions_source.get("totalProfit"))
-
-        if daily_profit is None:
-            daily_profit = sum(
-                _parse_float(row.get("dayProfit")) or 0.0
-                for row in rows
-                if isinstance(row, dict)
-            )
-
-        total_return_ratio = None
-        if nav is not None:
-            total_return_ratio = nav - 1
-        elif total_assets is not None and initial_capital not in (None, 0):
-            total_return_ratio = total_assets / initial_capital - 1
-
-        daily_return_ratio = None
-        if daily_profit is not None and total_assets is not None:
-            previous_assets = total_assets - daily_profit
-            if previous_assets > 0:
-                daily_return_ratio = daily_profit / previous_assets
-
-        if daily_profit_trade_date is None:
-            today = now_shanghai().date()
-            if trading_calendar_service.is_trading_day(today):
-                daily_profit_trade_date = today.isoformat()
-            else:
-                probe = today - timedelta(days=1)
-                for _ in range(30):
-                    if trading_calendar_service.is_trading_day(probe):
-                        break
-                    probe -= timedelta(days=1)
-                daily_profit_trade_date = probe.isoformat()
-
-        normalized_positions: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            amount = (
-                _parse_float(
-                    row.get("marketValue")
-                    or row.get("market_amount")
-                    or row.get("amount")
-                    or row.get("positionValue")
-                    or row.get("value")
-                )
-                or 0.0
-            )
-            profit_value = _parse_float(
-                row.get("profitRatio")
-                or row.get("profit_rate")
-                or row.get("yieldRate")
-                or row.get("profitPercent")
-                or row.get("profitPct")
-            )
-            profit_ratio = _normalize_percent(profit_value)
-            day_profit_ratio = _normalize_percent(_parse_float(row.get("dayProfitPct")))
-            position_ratio = None
-            if total_assets and total_assets > 0:
-                position_ratio = max(0.0, min(1.0, amount / total_assets))
-            if position_ratio is None:
-                position_ratio = _normalize_percent(_parse_float(row.get("posPct")))
-
-            raw_symbol = str(
-                row.get("stockCode")
-                or row.get("code")
-                or row.get("SECURITY_CODE")
-                or row.get("secCode")
-                or ""
-            ).strip()
-            market_code = row.get("secMkt")
-            if market_code is None:
-                market_code = row.get("market")
-            suffix = _market_suffix(market_code)
-            symbol = f"{raw_symbol}.{suffix}" if raw_symbol and suffix else raw_symbol
-
-            normalized_positions.append(
-                {
-                    "name": str(
-                        row.get("stockName")
-                        or row.get("name")
-                        or row.get("SECURITY_SHORT_NAME")
-                        or row.get("secName")
-                        or ""
-                    ).strip(),
-                    "symbol": symbol,
-                    "amount": amount,
-                    "volume": int(_parse_float(row.get("count")) or 0),
-                    "available_volume": int(_parse_float(row.get("availCount")) or 0),
-                    "day_profit": _parse_float(row.get("dayProfit")),
-                    "day_profit_ratio": day_profit_ratio,
-                    "profit": _parse_float(row.get("profit")),
-                    "profit_ratio": profit_ratio,
-                    "profit_text": self._format_profit_text(profit_ratio),
-                    "current_price": _scaled_decimal(
-                        _coalesce(row.get("price"), row.get("currentPrice")),
-                        _coalesce(row.get("priceDec"), row.get("priceDecimal")),
-                    ),
-                    "cost_price": _scaled_decimal(
-                        _coalesce(row.get("costPrice"), row.get("cost_price")),
-                        _coalesce(row.get("costPriceDec"), row.get("costPriceDecimal")),
-                    ),
-                    "position_ratio": position_ratio,
-                }
-            )
-
-        normalized_positions.sort(key=lambda item: item["amount"], reverse=True)
-        return {
-            "open_date": open_date,
-            "daily_profit_trade_date": daily_profit_trade_date,
-            "operating_days": operating_days,
-            "initial_capital": initial_capital,
-            "total_assets": total_assets,
-            "total_market_value": total_market_value,
-            "cash_balance": cash_balance,
-            "total_position_ratio": total_position_ratio,
-            "holding_profit": holding_profit
-            if holding_profit is not None
-            else _parse_float(
-                (positions_payload or {}).get("data", {}).get("totalProfit")
-            )
-            if isinstance((positions_payload or {}).get("data"), dict)
-            else None,
-            "daily_profit": daily_profit,
-            "total_return_ratio": total_return_ratio,
-            "nav": nav,
-            "daily_return_ratio": daily_return_ratio,
-            "positions": normalized_positions,
-            "trade_summaries": [],
-        }
+        original_now_shanghai = account_service_module.now_shanghai
+        account_service_module.now_shanghai = now_shanghai
+        try:
+            return account_service.build_account_overview(balance_payload, positions_payload)
+        finally:
+            account_service_module.now_shanghai = original_now_shanghai
 
     def _format_profit_text(self, profit_ratio: float | None) -> str:
-        if profit_ratio is None:
-            return "--"
-        return f"{profit_ratio * 100:.2f}%"
+        return account_service.format_profit_text(profit_ratio)
 
 
 aniu_service = AniuService()

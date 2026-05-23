@@ -1,4 +1,4 @@
-import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, RuntimeOverview, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
+import type { AccountOverview, AppSettings, ChatAttachment, ChatRequest, ChatResponse, ChatSession, ChatSessionMessagesPayload, LoginRequest, LoginResponse, PersistentSession, PersistentSessionMessagesPayload, RawToolPreviewDetail, RunDetail, RunSummary, RunSummaryPage, ScheduleConfig, SkillInfo, SkillListItem } from '../types.ts'
 import {
   LOGIN_NOTICE_STORAGE_KEY,
   LOGIN_REDIRECT_STORAGE_KEY,
@@ -357,9 +357,6 @@ export const api = {
       method: 'DELETE',
     })
   },
-  getRuntimeOverview() {
-    return request<RuntimeOverview>(`${API_PREFIX}/runtime-overview`)
-  },
   getAccount(forceRefresh = false) {
     const params = new URLSearchParams()
     if (forceRefresh) {
@@ -415,6 +412,11 @@ export const api = {
   },
   getPersistentSession() {
     return request<PersistentSession>(`${API_PREFIX}/persistent-session`)
+  },
+  deletePersistentSession() {
+    return request<void>(`${API_PREFIX}/persistent-session`, {
+      method: 'DELETE',
+    })
   },
   getPersistentSessionMessages(options: ListChatMessagesOptions = {}) {
     const params = new URLSearchParams()

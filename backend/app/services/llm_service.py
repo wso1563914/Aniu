@@ -232,7 +232,7 @@ class LLMService:
         base_url: str,
         api_key: str,
         system_prompt: str | None,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         timeout_seconds: int = 60,
         tool_context: dict[str, Any] | None = None,
         emit: Any = None,
@@ -447,6 +447,9 @@ class LLMService:
                 "role": "assistant",
                 "content": message.get("content") or "",
             }
+            assistant_reasoning = _to_text_content(message.get("reasoning_content"))
+            if assistant_reasoning:
+                assistant_entry["reasoning_content"] = assistant_reasoning
             if message.get("tool_calls"):
                 assistant_entry["tool_calls"] = message["tool_calls"]
             messages.append(assistant_entry)
@@ -628,6 +631,7 @@ class LLMService:
     ) -> dict[str, Any]:
         data_lines: list[str] = []
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
         finish_reason: str | None = None
@@ -720,6 +724,10 @@ class LLMService:
                         final_started = True
                     emit("final_delta", delta=delta_text)
 
+            delta_reasoning = _to_stream_text_content(delta.get("reasoning_content"))
+            if delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+
         for raw_line in lines:
             _raise_if_cancelled(cancel_event)
             line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8")
@@ -740,6 +748,7 @@ class LLMService:
             _flush_payload("\n".join(data_lines))
 
         final_text = "".join(content_parts)
+        final_reasoning = "".join(reasoning_parts)
         if stream_mode != "tool":
             if not final_started:
                 emit("final_started", char_count=len(final_text))
@@ -750,6 +759,8 @@ class LLMService:
             "role": "assistant",
             "content": final_text,
         }
+        if final_reasoning:
+            message["reasoning_content"] = final_reasoning
         ordered_tool_calls = [tool_calls[idx] for idx in sorted(tool_calls)]
         if ordered_tool_calls:
             message["tool_calls"] = ordered_tool_calls

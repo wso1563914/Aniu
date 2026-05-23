@@ -102,34 +102,6 @@ export interface RunSummaryPage {
   has_more: boolean
 }
 
-export interface RuntimeSummarySection {
-  analysis_count: number
-  api_calls: number
-  trades: number
-  success_rate: number
-  input_tokens: string
-  output_tokens: string
-  total_tokens: string
-}
-
-export interface RuntimeLastRun {
-  start_time: string
-  end_time: string
-  status: string
-  status_text: string
-  duration: string
-  input_tokens: string
-  output_tokens: string
-  total_tokens: string
-}
-
-export interface RuntimeOverview {
-  last_run: RuntimeLastRun
-  today: RuntimeSummarySection
-  recent_3_days: RuntimeSummarySection
-  recent_7_days: RuntimeSummarySection
-}
-
 export interface TradeOrder {
   id: number
   symbol: string

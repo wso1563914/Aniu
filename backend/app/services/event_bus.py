@@ -26,7 +26,7 @@ _MAX_REPLAY_EVENTS = 500
 
 
 class _RunChannel:
-    __slots__ = ("run_id", "subscribers", "history", "finished_at", "lock")
+    __slots__ = ("run_id", "subscribers", "history", "finished_at", "lock", "sequence")
 
     def __init__(self, run_id: int) -> None:
         self.run_id = run_id
@@ -34,6 +34,7 @@ class _RunChannel:
         self.history: list[dict[str, Any]] = []
         self.finished_at: float | None = None
         self.lock = threading.Lock()
+        self.sequence = 0
 
 
 class EventBus:
@@ -64,6 +65,8 @@ class EventBus:
 
         channel = self._get_or_create(run_id)
         with channel.lock:
+            channel.sequence += 1
+            payload.setdefault("sequence", channel.sequence)
             channel.history.append(payload)
             if len(channel.history) > _MAX_REPLAY_EVENTS:
                 del channel.history[: len(channel.history) - _MAX_REPLAY_EVENTS]

@@ -73,6 +73,12 @@ export function usePersistentSession() {
     }
   }
 
+  async function deleteSession(): Promise<void> {
+    await api.deletePersistentSession()
+    clear()
+    await refreshSummaryOnly()
+  }
+
   function clear() {
     session.value = null
     messages.value = []
@@ -118,6 +124,7 @@ export function usePersistentSession() {
     loadSession,
     refreshSummaryOnly,
     loadOlderMessages,
+    deleteSession,
     appendSystemMessage,
     clear,
   }

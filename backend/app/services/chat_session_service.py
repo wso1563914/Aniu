@@ -672,9 +672,9 @@ class ChatSessionService:
             )
 
         with session_scope() as db:
-            from app.services.aniu_service import aniu_service
+            from app.services.settings_service import settings_service
 
-            settings = aniu_service.get_or_create_settings(db)
+            settings = settings_service.get_or_create_settings(db)
             if not settings.llm_base_url or not settings.llm_api_key:
                 raise RuntimeError("未配置大模型接口，无法执行 AI 聊天。")
 

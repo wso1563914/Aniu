@@ -82,9 +82,9 @@ class SkillAdminService:
     def _get_or_create_settings(self, db: Session) -> AppSettings:
         instance = db.scalar(select(AppSettings).limit(1))
         if instance is None:
-            from app.services.aniu_service import aniu_service
+            from app.services.settings_service import settings_service
 
-            instance = aniu_service.get_or_create_settings(db)
+            instance = settings_service.get_or_create_settings(db)
         return instance
 
     def _get_disabled_skill_ids(self, db: Session) -> set[str]:

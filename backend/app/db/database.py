@@ -46,9 +46,11 @@ def init_db() -> None:
     _ensure_chat_message_columns(engine)
     _ensure_strategy_schedule_columns(engine)
     _ensure_strategy_run_columns(engine)
+    _ensure_run_event_columns(engine)
     _ensure_chat_session_indexes(engine)
     _ensure_chat_message_indexes(engine)
     _ensure_strategy_run_indexes(engine)
+    _ensure_run_event_indexes(engine)
     _backfill_schedule_run_types(engine)
     _backfill_strategy_run_types(engine)
 
@@ -352,6 +354,61 @@ def _ensure_strategy_run_indexes(engine) -> None:
     if "ix_strategy_runs_schedule_id" not in index_names:
         statements.append(
             "CREATE INDEX ix_strategy_runs_schedule_id ON strategy_runs (schedule_id)"
+        )
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _ensure_run_event_columns(engine) -> None:
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "run_events" in table_names:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE run_events ("
+                "id INTEGER NOT NULL PRIMARY KEY, "
+                "run_id INTEGER NOT NULL, "
+                "sequence INTEGER NOT NULL DEFAULT 1, "
+                "event_type VARCHAR(64) NOT NULL, "
+                "state_name VARCHAR(64), "
+                "payload JSON, "
+                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP, "
+                "FOREIGN KEY(run_id) REFERENCES strategy_runs (id) ON DELETE CASCADE"
+                ")"
+            )
+        )
+
+
+def _ensure_run_event_indexes(engine) -> None:
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "run_events" not in table_names:
+        return
+
+    index_names = {
+        index["name"]
+        for index in inspector.get_indexes("run_events")
+        if index.get("name")
+    }
+
+    statements: list[str] = []
+    if "ix_run_events_run_id" not in index_names:
+        statements.append("CREATE INDEX ix_run_events_run_id ON run_events (run_id)")
+    if "ix_run_events_event_type" not in index_names:
+        statements.append(
+            "CREATE INDEX ix_run_events_event_type ON run_events (event_type)"
+        )
+    if "ix_run_events_created_at" not in index_names:
+        statements.append(
+            "CREATE INDEX ix_run_events_created_at ON run_events (created_at)"
         )
 
     if not statements:

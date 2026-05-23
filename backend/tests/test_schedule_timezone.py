@@ -1242,6 +1242,177 @@ def test_manual_trade_run_overrides_default_run_type(monkeypatch, tmp_path) -> N
     assert "生成交易决策" in str(captured["task_prompt"])
 
 
+def test_manual_run_revises_unsupported_price_type_before_execution(
+    monkeypatch, tmp_path
+) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请执行测试交易。",
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del app_settings, client, messages, emit
+        return (
+            {
+                "final_answer": "执行修正后的交易。",
+                "tool_calls": [
+                    {
+                        "name": "mx_moni_trade",
+                        "result": {
+                            "ok": True,
+                            "executed_action": {
+                                "action": "BUY",
+                                "symbol": "300059",
+                                "quantity": 100,
+                                "price_type": "BEST",
+                            },
+                            "result": {"order_id": "A-1"},
+                        },
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+
+    run = aniu_service.execute_run(trigger_source="manual")
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert run.executed_actions is not None
+    assert run.executed_actions[0]["price_type"] == "MARKET"
+    assert run.decision_payload is not None
+    assert run.decision_payload["policy_decisions"][0]["decision"] == "revise"
+    assert run.decision_payload["policy_decisions"][0]["revised_proposal"]["price_type"] == "MARKET"
+
+
+def test_schedule_analysis_run_rejects_trade_actions_via_policy_check(
+    monkeypatch, tmp_path
+) -> None:
+    _use_temp_db(monkeypatch, tmp_path)
+    init_db()
+
+    from app.services import aniu_service as aniu_service_module
+
+    with session_scope() as db:
+        schedule = StrategySchedule(
+            name="盘前分析",
+            run_type="analysis",
+            cron_expression="0 8 * * 1-5",
+            task_prompt="请给出分析。",
+            timeout_seconds=1800,
+            enabled=True,
+        )
+        db.add(schedule)
+        db.flush()
+        schedule_id = schedule.id
+
+    monkeypatch.setattr(
+        aniu_service_module.aniu_service,
+        "get_or_create_settings",
+        lambda db: type(
+            "StubSettings",
+            (),
+            {
+                "id": 1,
+                "mx_api_key": "demo-key",
+                "llm_base_url": "https://example.com/v1",
+                "llm_api_key": "token",
+                "llm_model": "demo-model",
+                "system_prompt": "prompt",
+                "timeout_seconds": 1800,
+                "task_prompt": "请给出分析。",
+            },
+        )(),
+    )
+
+    class StubClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def fake_run_agent_with_messages(*, app_settings, client, messages, emit=None):
+        del app_settings, client, messages, emit
+        return (
+            {
+                "final_answer": "建议买入，但应被策略拒绝。",
+                "tool_calls": [
+                    {
+                        "name": "mx_moni_trade",
+                        "result": {
+                            "ok": True,
+                            "executed_action": {
+                                "action": "BUY",
+                                "symbol": "300059",
+                                "quantity": 100,
+                                "price_type": "MARKET",
+                            },
+                            "result": {"order_id": "A-1"},
+                        },
+                    }
+                ],
+            },
+            {"messages": []},
+            {"responses": []},
+            {"messages": []},
+        )
+
+    monkeypatch.setattr(aniu_service_module, "MXClient", StubClient)
+    monkeypatch.setattr(
+        aniu_service_module.llm_service,
+        "run_agent_with_messages",
+        fake_run_agent_with_messages,
+    )
+
+    run = aniu_service.execute_run(trigger_source="schedule", schedule_id=schedule_id)
+
+    _reset_db_state()
+
+    assert run.status == "completed"
+    assert run.executed_actions == []
+    assert run.trade_orders == []
+    assert run.decision_payload is not None
+    assert run.decision_payload["policy_decisions"][0]["decision"] == "rejected"
+    assert run.decision_payload["policy_decisions"][0]["message"] == "trade actions require trade run type"
+
+
 def test_daily_profit_trade_date_falls_back_to_previous_trading_day_on_weekend(
     monkeypatch,
 ) -> None:

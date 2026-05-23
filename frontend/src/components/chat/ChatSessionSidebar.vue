@@ -38,6 +38,16 @@
               <span class="chat-session-title">持久会话</span>
               <span class="chat-session-meta">{{ persistentMeta }}</span>
             </div>
+            <div class="chat-session-actions" @click.stop>
+              <button
+                type="button"
+                class="chat-session-action danger"
+                title="删除持久会话"
+                @click="handleDeletePersistent"
+              >
+                删除
+              </button>
+            </div>
           </li>
         </ul>
       </section>
@@ -96,6 +106,7 @@ const emit = defineEmits<{
   (e: 'selectPersistent'): void
   (e: 'create'): void
   (e: 'delete', sessionId: number): void
+  (e: 'deletePersistent'): void
 }>()
 
 const query = ref('')
@@ -114,6 +125,12 @@ function handleDelete(session: ChatSession) {
   const confirmed = window.confirm(`确定删除对话“${session.title || '新对话'}”吗？`)
   if (!confirmed) return
   emit('delete', session.id)
+}
+
+function handleDeletePersistent() {
+  const confirmed = window.confirm('确定删除持久会话中的全部上下文吗？')
+  if (!confirmed) return
+  emit('deletePersistent')
 }
 
 function formatTime(value: string | null): string {

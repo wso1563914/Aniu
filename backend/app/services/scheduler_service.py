@@ -4,7 +4,7 @@ import logging
 from threading import Event, Thread
 
 from app.core.config import get_settings
-from app.services.aniu_service import aniu_service
+from app.services.run_service import run_service
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class SchedulerService:
         poll_seconds = max(5, get_settings().scheduler_poll_seconds)
         while not self._stop_event.is_set():
             try:
-                aniu_service.process_due_schedule()
+                run_service.process_due_schedule()
             except Exception as exc:
                 logger.exception("scheduler loop error: %s", exc)
             self._stop_event.wait(poll_seconds)

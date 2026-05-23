@@ -971,21 +971,6 @@ def test_runtime_overview_endpoint_returns_aggregated_stats(monkeypatch, tmp_pat
                 ]
             )
 
-        headers = _auth_headers(client)
-        response = client.get("/api/aniu/runtime-overview", headers=headers)
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["today"]["analysis_count"] == 2
-    assert payload["today"]["api_calls"] == 3
-    assert payload["today"]["trades"] == 1
-    assert payload["today"]["success_rate"] == 50.0
-
-    database_module._engine = None
-    database_module._session_local = None
-    get_settings.cache_clear()
-
-
 def test_delete_run_endpoint_removes_run_and_related_messages(monkeypatch, tmp_path) -> None:
     with create_test_client(monkeypatch, tmp_path) as client:
         with session_scope() as db:
@@ -1241,6 +1226,63 @@ def test_persistent_session_messages_endpoint_returns_messages(monkeypatch, tmp_
         assert payload["session"]["slug"] == "automation-default"
         assert [item["content"] for item in payload["messages"]] == ["first", "second"]
         assert payload["has_more"] is False
+
+    database_module._engine = None
+    database_module._session_local = None
+    get_settings.cache_clear()
+
+
+def test_delete_persistent_session_endpoint_clears_messages_and_summary(
+    monkeypatch, tmp_path
+) -> None:
+    with create_test_client(monkeypatch, tmp_path) as client:
+        with session_scope() as db:
+            session = ChatSession(
+                title="自动化交易会话",
+                kind="automation",
+                slug="automation-default",
+                archived_summary="## 当前策略\n- 继续观察",
+                summary_revision=2,
+                last_compacted_message_id=99,
+                last_compacted_run_id=88,
+            )
+            db.add(session)
+            db.flush()
+            db.add_all(
+                [
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="user",
+                        content="first",
+                    ),
+                    ChatMessageRecord(
+                        session_id=session.id,
+                        role="assistant",
+                        content="second",
+                    ),
+                ]
+            )
+
+        headers = _auth_headers(client)
+        response = client.delete("/api/aniu/persistent-session", headers=headers)
+
+        assert response.status_code == 204
+
+        summary_response = client.get("/api/aniu/persistent-session", headers=headers)
+        assert summary_response.status_code == 200
+        summary_payload = summary_response.json()
+        assert summary_payload["title"] == "自动化交易会话"
+        assert summary_payload["slug"] == "automation-default"
+        assert summary_payload["message_count"] == 0
+        assert summary_payload["archived_summary"] is None
+        assert summary_payload["summary_revision"] == 0
+
+        messages_response = client.get(
+            "/api/aniu/persistent-session/messages?limit=10",
+            headers=headers,
+        )
+        assert messages_response.status_code == 200
+        assert messages_response.json()["messages"] == []
 
     database_module._engine = None
     database_module._session_local = None

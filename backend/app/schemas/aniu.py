@@ -208,34 +208,6 @@ class RunSummaryPageRead(BaseModel):
     has_more: bool = False
 
 
-class RuntimeSummarySectionRead(BaseModel):
-    analysis_count: int = 0
-    api_calls: int = 0
-    trades: int = 0
-    success_rate: float = 0.0
-    input_tokens: str = "--"
-    output_tokens: str = "--"
-    total_tokens: str = "--"
-
-
-class RuntimeLastRunRead(BaseModel):
-    start_time: str = "--"
-    end_time: str = "--"
-    status: str = "idle"
-    status_text: str = "暂无记录"
-    duration: str = "--"
-    input_tokens: str = "--"
-    output_tokens: str = "--"
-    total_tokens: str = "--"
-
-
-class RuntimeOverviewRead(BaseModel):
-    last_run: RuntimeLastRunRead = Field(default_factory=RuntimeLastRunRead)
-    today: RuntimeSummarySectionRead = Field(default_factory=RuntimeSummarySectionRead)
-    recent_3_days: RuntimeSummarySectionRead = Field(default_factory=RuntimeSummarySectionRead)
-    recent_7_days: RuntimeSummarySectionRead = Field(default_factory=RuntimeSummarySectionRead)
-
-
 class PositionOverviewRead(BaseModel):
     name: str
     symbol: str

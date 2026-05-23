@@ -128,6 +128,11 @@ class StrategyRun(Base):
         back_populates="run",
         cascade="all, delete-orphan",
     )
+    events: Mapped[list["RunEvent"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="RunEvent.sequence",
+    )
 
 
 class TradeOrder(Base):
@@ -145,6 +150,20 @@ class TradeOrder(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     run: Mapped[StrategyRun] = relationship(back_populates="trade_orders")
+
+
+class RunEvent(Base):
+    __tablename__ = "run_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("strategy_runs.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=1)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    state_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+
+    run: Mapped[StrategyRun] = relationship(back_populates="events")
 
 
 class ChatSession(Base):

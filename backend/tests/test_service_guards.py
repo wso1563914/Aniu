@@ -8,6 +8,9 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from app.db.database import init_db
 from app.db.models import StrategySchedule
+from app.domain.trading.intents import TradeProposal
+from app.skills import skill_registry
+from app.domain.trading.risk_gate import risk_gate
 from app.services.aniu_service import aniu_service
 from app.services.llm_service import LLMService, LLMUpstreamError, llm_service
 from skills.mx_core.execution import mx_execution_service as mx_skill_service
@@ -100,6 +103,81 @@ def test_infer_run_type_recovers_trade_runs_from_actions() -> None:
     )
 
     assert aniu_service._infer_run_type(run) == "trade"
+
+
+def test_risk_gate_rejects_trade_actions_for_analysis_runs() -> None:
+    proposal = TradeProposal(
+        symbol="300059",
+        action="BUY",
+        quantity=100,
+        price_type="MARKET",
+    )
+
+    decision = risk_gate.evaluate(
+        proposal=proposal,
+        run_type="analysis",
+        trade_enabled=True,
+    )
+
+    assert decision.decision == "rejected"
+    assert decision.message == "trade actions require trade run type"
+
+
+def test_risk_gate_rejects_trade_actions_when_trade_disabled() -> None:
+    proposal = TradeProposal(
+        symbol="300059",
+        action="SELL",
+        quantity=100,
+        price_type="MARKET",
+    )
+
+    decision = risk_gate.evaluate(
+        proposal=proposal,
+        run_type="trade",
+        trade_enabled=False,
+    )
+
+    assert decision.decision == "rejected"
+    assert decision.message == "trade disabled by settings"
+
+
+def test_risk_gate_rejects_non_positive_trade_quantity() -> None:
+    proposal = TradeProposal(
+        symbol="300059",
+        action="BUY",
+        quantity=0,
+        price_type="MARKET",
+    )
+
+    decision = risk_gate.evaluate(
+        proposal=proposal,
+        run_type="trade",
+        trade_enabled=True,
+    )
+
+    assert decision.decision == "rejected"
+    assert decision.message == "trade quantity must be positive"
+
+
+def test_risk_gate_revises_unsupported_price_type_to_market() -> None:
+    proposal = TradeProposal(
+        symbol="300059",
+        action="BUY",
+        quantity=100,
+        price_type="BEST",
+    )
+
+    decision = risk_gate.evaluate(
+        proposal=proposal,
+        run_type="trade",
+        trade_enabled=True,
+    )
+
+    assert decision.decision == "revise"
+    assert decision.retryable is True
+    assert decision.message == "unsupported price_type revised to MARKET"
+    assert decision.revised_proposal is not None
+    assert decision.revised_proposal.price_type == "MARKET"
 
 
 def test_build_tools_excludes_trade_mutations_for_analysis_runs() -> None:
@@ -302,6 +380,89 @@ def test_parse_llm_stream_response_raises_for_error_chunk() -> None:
 
     with pytest.raises(RuntimeError, match="大模型流式响应错误: quota exceeded"):
         service._parse_llm_stream_response(lines=lines, emit=lambda *_a, **_kw: None)
+
+
+def test_parse_llm_stream_response_collects_reasoning_content() -> None:
+    service = LLMService()
+
+    lines = iter(
+        [
+            'data: {"choices":[{"delta":{"reasoning_content":"先查工具。"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"reasoning_content":"再整理答案。"}}]}',
+            "",
+            'data: {"choices":[{"delta":{"content":"最终回复"},"finish_reason":"stop"}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ]
+    )
+
+    response = service._parse_llm_stream_response(
+        lines=lines,
+        emit=lambda *_a, **_kw: None,
+    )
+
+    message = response["choices"][0]["message"]
+    assert message["reasoning_content"] == "先查工具。再整理答案。"
+    assert message["content"] == "最终回复"
+
+
+def test_agent_loop_replays_reasoning_content_after_tool_call(monkeypatch) -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    def fake_call_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": "需要先调用工具。",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "demo_tool",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        assistant_message = seen_payloads[1]["messages"][-2]
+        assert assistant_message["role"] == "assistant"
+        assert assistant_message["reasoning_content"] == "需要先调用工具。"
+        assert assistant_message["tool_calls"][0]["function"]["name"] == "demo_tool"
+        return {"choices": [{"message": {"content": "最终回复"}}]}
+
+    monkeypatch.setattr(service, "_call_llm_stream", fake_call_llm_stream)
+    monkeypatch.setattr(skill_registry, "build_tools", lambda run_type=None: [])
+
+    result = service._agent_loop(
+        model="demo-model",
+        base_url="https://example.com/v1",
+        api_key="token",
+        initial_messages=[{"role": "user", "content": "帮我查一下"}],
+        run_type="chat",
+        timeout_seconds=5,
+        tool_executor=lambda tool_name, arguments: {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": "工具已执行",
+            "result": {"arguments": arguments},
+        },
+    )
+
+    assert result["final_answer"] == "最终回复"
+    assert len(seen_payloads) == 2
 
 
 def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:

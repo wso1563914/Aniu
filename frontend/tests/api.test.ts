@@ -176,3 +176,25 @@ test('fetchChatAttachmentBlob 使用认证头并携带超时 signal', async () =
     browser.restore()
   }
 })
+
+test('deletePersistentSession 使用认证头并发送 DELETE 请求', async () => {
+  const browser = installBrowserMocks()
+
+  try {
+    setStoredToken('persistent-token')
+
+    browser.setFetch(async (_input, init) => {
+      const headers = new Headers(init?.headers)
+      assert.equal(headers.get('Authorization'), 'Bearer persistent-token')
+      assert.equal(init?.method, 'DELETE')
+      assert.ok(init?.signal instanceof AbortSignal)
+      return new Response(null, {
+        status: 204,
+      })
+    })
+
+    await api.deletePersistentSession()
+  } finally {
+    browser.restore()
+  }
+})

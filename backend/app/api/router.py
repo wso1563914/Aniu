@@ -7,6 +7,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, 
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.api.routes.account import router as account_router
+from app.api.routes.persistent_session import router as persistent_session_router
+from app.api.routes.runs import router as runs_router
+from app.api.routes.schedules import router as schedule_router
+from app.api.routes.settings import router as settings_router
 from app.core.auth import get_current_user
 from app.db.database import get_db
 from app.schemas.aniu import (
@@ -31,7 +36,6 @@ from app.schemas.aniu import (
     RawToolPreviewDetailRead,
     RunSummaryRead,
     RunSummaryPageRead,
-    RuntimeOverviewRead,
     ScheduleRead,
     ScheduleUpdate,
     SkillImportClawHubRequest,
@@ -52,6 +56,11 @@ from app.services.skill_admin_service import (
 )
 
 router = APIRouter(prefix="/api/aniu", tags=["aniu"])
+router.include_router(account_router)
+router.include_router(persistent_session_router)
+router.include_router(settings_router)
+router.include_router(schedule_router)
+router.include_router(runs_router)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -60,23 +69,6 @@ def login(payload: LoginRequest) -> LoginResponse:
         return aniu_service.authenticate_login(payload.password)
     except RuntimeError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
-
-
-@router.get("/settings", response_model=AppSettingsRead)
-def get_settings(
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> AppSettingsRead:
-    return aniu_service.get_or_create_settings(db)
-
-
-@router.put("/settings", response_model=AppSettingsRead)
-def update_settings(
-    payload: AppSettingsUpdate,
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> AppSettingsRead:
-    return aniu_service.update_settings(db, payload)
 
 
 @router.get("/skills", response_model=list[SkillListItemRead])
@@ -196,203 +188,6 @@ def delete_skill(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("/schedule", response_model=list[ScheduleRead])
-def get_schedule(
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> list[ScheduleRead]:
-    return aniu_service.list_schedules(db)
-
-
-@router.put("/schedule", response_model=list[ScheduleRead])
-def update_schedule(
-    payload: list[ScheduleUpdate],
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> list[ScheduleRead]:
-    return aniu_service.replace_schedules(db, payload)
-
-
-@router.post("/run", response_model=RunDetailRead)
-def run_once(
-    schedule_id: int | None = Query(default=None, ge=1),
-    run_type: Literal["analysis", "trade"] | None = Query(default=None),
-    _user: str = Depends(get_current_user),
-) -> RunDetailRead:
-    try:
-        return aniu_service.execute_run(
-            trigger_source="manual",
-            schedule_id=schedule_id,
-            manual_run_type=run_type,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.post("/run-stream")
-def run_stream(
-    schedule_id: int | None = Query(default=None, ge=1),
-    run_type: Literal["analysis", "trade"] | None = Query(default=None),
-    _user: str = Depends(get_current_user),
-) -> dict:
-    """Launch a run in the background and return run_id immediately.
-
-    Subscribe to progress events via GET /api/aniu/runs/{run_id}/events.
-    """
-    try:
-        run_id = aniu_service.start_run_async(
-            trigger_source="manual",
-            schedule_id=schedule_id,
-            manual_run_type=run_type,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"run_id": run_id}
-
-
-@router.get("/runs/{run_id}/events")
-def run_events(
-    run_id: int,
-    _user: str = Depends(get_current_user),
-) -> StreamingResponse:
-    def _generator():
-        try:
-            for event in event_bus.stream(run_id):
-                event_type = str(event.get("type") or "message")
-                data = json.dumps(event, ensure_ascii=False)
-                yield f"event: {event_type}\ndata: {data}\n\n"
-        except Exception as exc:  # noqa: BLE001
-            err = json.dumps({"type": "failed", "message": str(exc)}, ensure_ascii=False)
-            yield f"event: failed\ndata: {err}\n\n"
-
-    headers = {
-        "Cache-Control": "no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    }
-    return StreamingResponse(
-        _generator(),
-        media_type="text/event-stream",
-        headers=headers,
-    )
-
-
-@router.get("/runs", response_model=list[RunSummaryRead])
-def list_runs(
-    limit: int = Query(default=20, ge=1, le=100),
-    run_date: date | None = Query(default=None, alias="date"),
-    status: str | None = Query(default=None),
-    before_id: int | None = Query(default=None, ge=1),
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> list[RunSummaryRead]:
-    return aniu_service.list_runs(
-        db,
-        limit=limit,
-        run_date=run_date,
-        status=status,
-        before_id=before_id,
-    )
-
-
-@router.get("/runs-feed", response_model=RunSummaryPageRead)
-def list_runs_feed(
-    limit: int = Query(default=20, ge=1, le=100),
-    run_date: date | None = Query(default=None, alias="date"),
-    status: str | None = Query(default=None),
-    before_id: int | None = Query(default=None, ge=1),
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> RunSummaryPageRead:
-    return aniu_service.list_runs_page(
-        db,
-        limit=limit,
-        run_date=run_date,
-        status=status,
-        before_id=before_id,
-    )
-
-
-@router.get("/runs/{run_id}", response_model=RunDetailRead)
-def get_run(
-    run_id: int,
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> RunDetailRead:
-    run = aniu_service.get_run(db, run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="运行记录不存在。")
-    return run
-
-
-@router.get(
-    "/runs/{run_id}/raw-tool-previews/{preview_index}",
-    response_model=RawToolPreviewDetailRead,
-)
-def get_run_raw_tool_preview(
-    run_id: int,
-    preview_index: int = Path(ge=0),
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> RawToolPreviewDetailRead:
-    try:
-        return aniu_service.get_run_raw_tool_preview(db, run_id, preview_index)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@router.delete("/runs/{run_id}", status_code=204)
-def delete_run(
-    run_id: int,
-    force: bool = Query(default=False),
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> None:
-    try:
-        aniu_service.delete_run(db, run_id, force=force)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@router.get("/runtime-overview", response_model=RuntimeOverviewRead)
-def get_runtime_overview(
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> RuntimeOverviewRead:
-    return aniu_service.get_runtime_overview(db)
-
-
-@router.get("/account", response_model=AccountOverviewRead)
-def get_account(
-    force_refresh: bool = Query(default=False),
-    _user: str = Depends(get_current_user),
-) -> AccountOverviewRead:
-    try:
-        return aniu_service.get_account_overview(force_refresh=force_refresh)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@router.get("/account/debug", response_model=AccountOverviewDebugRead)
-def get_account_debug(
-    force_refresh: bool = Query(default=False),
-    _user: str = Depends(get_current_user),
-) -> AccountOverviewDebugRead:
-    try:
-        return aniu_service.get_account_overview(
-            include_raw=True,
-            force_refresh=force_refresh,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest,
@@ -508,37 +303,6 @@ def list_chat_messages(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {
-        "session": session.model_dump(mode="json"),
-        "messages": [m.model_dump(mode="json") for m in messages],
-        "next_before_id": next_before_id,
-        "has_more": has_more,
-    }
-
-
-@router.get("/persistent-session", response_model=PersistentSessionRead)
-def get_persistent_session(
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> PersistentSessionRead:
-    return aniu_service.get_persistent_session(db)
-
-
-@router.get(
-    "/persistent-session/messages",
-    response_model=PersistentSessionMessagesPageRead,
-)
-def list_persistent_session_messages(
-    limit: int = Query(default=50, ge=1, le=100),
-    before_id: int | None = Query(default=None, ge=1),
-    db: Session = Depends(get_db),
-    _user: str = Depends(get_current_user),
-) -> PersistentSessionMessagesPageRead:
-    session, messages, next_before_id, has_more = aniu_service.list_persistent_session_messages(
-        db,
-        limit=limit,
-        before_id=before_id,
-    )
     return {
         "session": session.model_dump(mode="json"),
         "messages": [m.model_dump(mode="json") for m in messages],
