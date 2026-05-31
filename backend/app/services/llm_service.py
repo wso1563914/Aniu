@@ -420,13 +420,15 @@ class LLMService:
 
         for iteration in range(_MAX_TOOL_ITERATIONS):
             _raise_if_cancelled(cancel_event)
+            tools = skill_registry.build_tools(run_type=run_type)
             iteration_payload = {
                 "model": model,
                 "temperature": _LLM_TEMPERATURE,
                 "messages": messages,
-                "tools": skill_registry.build_tools(run_type=run_type),
-                "tool_choice": "auto",
             }
+            if tools:
+                iteration_payload["tools"] = tools
+                iteration_payload["tool_choice"] = "auto"
             _emit("llm_request", iteration=iteration + 1, model=model)
             response_payload = self._call_llm_stream(
                 base_url=base_url,
@@ -443,6 +445,43 @@ class LLMService:
                 raise RuntimeError("大模型未返回 choices。")
 
             message = choices[0].get("message") or {}
+            assistant_text = _to_text_content(message.get("content"))
+            tool_calls = message.get("tool_calls") or []
+            finish_reason = choices[0].get("finish_reason")
+            if (
+                str(run_type or "").strip() == "chat"
+                and tools
+                and not assistant_text
+                and not tool_calls
+                and (not isinstance(finish_reason, str) or finish_reason == "stop")
+            ):
+                fallback_payload = {
+                    "model": model,
+                    "temperature": _LLM_TEMPERATURE,
+                    "messages": messages,
+                }
+                _emit(
+                    "llm_request",
+                    iteration=iteration + 1,
+                    model=model,
+                    tools_disabled=True,
+                )
+                response_payload = self._call_llm_stream(
+                    base_url=base_url,
+                    api_key=api_key,
+                    payload=fallback_payload,
+                    timeout_seconds=timeout_seconds,
+                    emit=_emit,
+                    cancel_event=cancel_event,
+                )
+                response_history.append(response_payload)
+                choices = response_payload.get("choices") or []
+                if not choices:
+                    raise RuntimeError("大模型未返回 choices。")
+                message = choices[0].get("message") or {}
+                assistant_text = _to_text_content(message.get("content"))
+                tool_calls = message.get("tool_calls") or []
+
             assistant_entry: dict[str, Any] = {
                 "role": "assistant",
                 "content": message.get("content") or "",
@@ -454,8 +493,6 @@ class LLMService:
                 assistant_entry["tool_calls"] = message["tool_calls"]
             messages.append(assistant_entry)
 
-            assistant_text = _to_text_content(message.get("content"))
-            tool_calls = message.get("tool_calls") or []
             if assistant_text and tool_calls:
                 _emit("llm_message", iteration=iteration + 1, content=assistant_text)
 

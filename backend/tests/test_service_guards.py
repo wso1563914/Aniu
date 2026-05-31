@@ -465,6 +465,64 @@ def test_agent_loop_replays_reasoning_content_after_tool_call(monkeypatch) -> No
     assert len(seen_payloads) == 2
 
 
+def test_chat_agent_loop_retries_without_tools_when_tool_mode_returns_empty(
+    monkeypatch,
+) -> None:
+    service = LLMService()
+    seen_payloads: list[dict[str, object]] = []
+
+    def fake_build_tools(run_type=None):
+        assert run_type == "chat"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "demo_tool",
+                    "description": "demo",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    def fake_call_llm_stream(*, payload, **kwargs):
+        del kwargs
+        seen_payloads.append(payload)
+        if len(seen_payloads) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {"content": ""},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        return {"choices": [{"message": {"content": "你好"}}]}
+
+    monkeypatch.setattr(skill_registry, "build_tools", fake_build_tools)
+    monkeypatch.setattr(service, "_call_llm_stream", fake_call_llm_stream)
+
+    result = service._agent_loop(
+        model="demo-model",
+        base_url="https://example.com/v1",
+        api_key="token",
+        initial_messages=[{"role": "user", "content": "你好"}],
+        run_type="chat",
+        timeout_seconds=5,
+        tool_executor=lambda tool_name, arguments: {
+            "ok": True,
+            "tool_name": tool_name,
+            "result": arguments,
+        },
+    )
+
+    assert result["final_answer"] == "你好"
+    assert len(seen_payloads) == 2
+    assert seen_payloads[0]["tools"]
+    assert seen_payloads[0]["tool_choice"] == "auto"
+    assert "tools" not in seen_payloads[1]
+    assert "tool_choice" not in seen_payloads[1]
+
+
 def test_call_llm_stream_retries_without_include_usage_on_400(monkeypatch) -> None:
     service = LLMService()
     seen_payloads: list[dict[str, object]] = []

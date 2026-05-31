@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0 - 2026-05-31
+
+- AI 聊天兼容性修复：当 OpenAI 兼容接口在携带 `tools` 时返回空文本且没有工具调用，聊天链路会自动用同一轮消息关闭 tools 重试，避免误显示“模型本轮未返回可展示内容”。
+- 流式请求更稳健：仅在实际存在工具时发送 `tools` / `tool_choice`，降低不同模型供应商对 tool calling 支持不完整时的兼容风险。
+- 补充回归测试：覆盖聊天模式 tools 空响应后的无工具降级路径，并验证既有聊天 API、会话流和后端测试集不回归。
+
 ## v0.3.9 - 2026-05-23
 
 - 自动化运行链路重构：拆分 `run_service`、`run_query_service`、`automation_session_service`、`settings_service` 等后端服务，补齐事件、领域与路由结构，降低 `aniu_service` 耦合度，便于后续维护与扩展。
